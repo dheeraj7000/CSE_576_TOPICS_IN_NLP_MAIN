@@ -1,540 +1,428 @@
+#!/usr/bin/env python3
 """
-Usage: python download_memory_optimized.py arxiv
+prepare_datasets.py - FIXED: Memory-Optimized Dataset Preparation
+
+Downloads and prepares 4 datasets for discourse-aware reasoning pretraining:
+- ArXiv (scientific papers)
+- PubMed (biomedical papers)
+- Legal (legal documents)
+- OpenWebMath (mathematical text)
+
+Memory-optimized: Saves every 10,000 documents to prevent OOM.
+Each batch saved to separate file, then combined.
+
+Usage:
+    python prepare_datasets.py arxiv          # Download ArXiv
+    python prepare_datasets.py pubmed         # Download PubMed
+    python prepare_datasets.py legal          # Download Legal
+    python prepare_datasets.py openwebmath    # Download OpenWebMath
+    python prepare_datasets.py combine        # Combine all
+    python prepare_datasets.py status         # Check status
 """
 
-from datasets import load_dataset, concatenate_datasets, load_from_disk, Dataset, DownloadConfig
-import sys
 import os
+import sys
+import logging
+from pathlib import Path
+from typing import Optional, Dict, List
 import warnings
+import shutil
+
+from datasets import (
+    load_dataset,
+    concatenate_datasets,
+    load_from_disk,
+    Dataset,
+    DownloadConfig,
+)
+
+from config import DATASETS, COMBINED_DATASET_PATH, BATCH_SIZE, NUM_WORKERS
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 os.environ['REQUESTS_TIMEOUT'] = '3600'
 warnings.filterwarnings('ignore')
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
+# ============================================================================
+# DATASET PREPARATION
+# ============================================================================
 
-def download_arxiv_streaming_batched():
-    """Download ArXiv using streaming with batched saving (prevents OOM)."""
-    print("\n" + "="*80)
-    print("DOWNLOADING ARXIV (MEMORY-OPTIMIZED)")
-    print("="*80)
-    print("Strategy: Download + Save every 10K papers to avoid memory issues")
-    print("="*80 + "\n")
+class DatasetPreparer:
+    """Handles downloading and preparing datasets with domain labels."""
     
-    # Load as stream
-    print("Starting streaming download...")
-    stream = load_dataset(
-        "armanc/scientific_papers",
-        "arxiv",
-        split="train",
-        streaming=True,
-        download_config=DownloadConfig(resume_download=True)
-    )
-    
-    # Process in batches
-    BATCH_SIZE = 10000
-    batch_data = []
-    batch_num = 0
-    total_count = 0
-    
-    print(f"Processing in batches of {BATCH_SIZE:,} papers...")
-    print("(This prevents memory overflow)\n")
-    
-    for item in stream:
-        batch_data.append(item)
-        total_count += 1
+    def __init__(self, batch_size: int = BATCH_SIZE, num_workers: int = NUM_WORKERS):
+        """Initialize dataset preparer."""
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.datasets_dir = Path(COMBINED_DATASET_PATH).parent / "raw_datasets"
+        self.datasets_dir.mkdir(parents=True, exist_ok=True)
         
-        # Progress update
-        if total_count % 1000 == 0:
-            print(f"  Downloaded: {total_count:,} papers...", end='\r')
+        logger.info(f"Datasets directory: {self.datasets_dir}")
+    
+    def get_dataset_path(self, dataset_name: str) -> Path:
+        """Get path for dataset."""
+        return self.datasets_dir / dataset_name
+    
+    def dataset_exists(self, dataset_name: str) -> bool:
+        """Check if dataset already downloaded."""
+        path = self.get_dataset_path(dataset_name)
+        return path.exists() and len(os.listdir(path)) > 0
+    
+    def download_arxiv(self) -> Dataset:
+        """Download ArXiv dataset with memory optimization."""
+        dataset_name = 'arxiv'
+        save_path = self.get_dataset_path(dataset_name)
         
-        # Save batch when full
-        if len(batch_data) >= BATCH_SIZE:
-            print(f"\n  Saving batch {batch_num} ({BATCH_SIZE:,} papers)...")
-            
-            # Convert batch to dataset
-            batch_dataset = Dataset.from_dict({
-                key: [item[key] for item in batch_data]
-                for key in batch_data[0].keys()
-            })
-            
-            # Add domain label
-            batch_dataset = batch_dataset.map(
-                lambda x: {**x, 'domain': 'arxiv'},
-                desc=f"Labeling batch {batch_num}"
-            )
-            
-            # Save batch
-            batch_path = f"./arxiv_batch_{batch_num:03d}"
-            batch_dataset.save_to_disk(batch_path)
-            print(f"  ✓ Batch {batch_num} saved to {batch_path}")
-            
-            # Clear memory
-            batch_data = []
-            batch_num += 1
-    
-    # Save remaining data
-    if batch_data:
-        print(f"\n  Saving final batch {batch_num} ({len(batch_data):,} papers)...")
-        batch_dataset = Dataset.from_dict({
-            key: [item[key] for item in batch_data]
-            for key in batch_data[0].keys()
-        })
-        batch_dataset = batch_dataset.map(
-            lambda x: {**x, 'domain': 'arxiv'},
-            desc=f"Labeling batch {batch_num}"
-        )
-        batch_path = f"./arxiv_batch_{batch_num:03d}"
-        batch_dataset.save_to_disk(batch_path)
-        print(f"  ✓ Batch {batch_num} saved")
-    
-    print(f"\n✓ Downloaded {total_count:,} papers in {batch_num + 1} batches")
-    
-    # Combine batches
-    print("\nCombining all batches...")
-    batch_datasets = []
-    for i in range(batch_num + 1):
-        batch_path = f"./arxiv_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            batch_datasets.append(load_from_disk(batch_path))
-            print(f"  Loaded batch {i}")
-    
-    combined = concatenate_datasets(batch_datasets)
-    print(f"✓ Combined: {len(combined):,} papers")
-    
-    # Save final dataset
-    print("\nSaving final ArXiv dataset...")
-    combined.save_to_disk("./arxiv_dataset")
-    
-    # Clean up batch files
-    print("Cleaning up temporary batch files...")
-    for i in range(batch_num + 1):
-        import shutil
-        batch_path = f"./arxiv_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            shutil.rmtree(batch_path)
-    
-    print("\n✓ ArXiv saved to: ./arxiv_dataset")
-    print(f"✓ Total papers: {len(combined):,}")
-    print("\nNext: Run: python download_memory_optimized.py pubmed")
-
-
-def download_pubmed_streaming_batched():
-    """Download PubMed using streaming with batched saving."""
-    print("\n" + "="*80)
-    print("DOWNLOADING PUBMED (MEMORY-OPTIMIZED)")
-    print("="*80)
-    print("Strategy: Download + Save every 10K papers")
-    print("="*80 + "\n")
-    
-    stream = load_dataset(
-        "armanc/scientific_papers",
-        "pubmed",
-        split="train",
-        streaming=True,
-        download_config=DownloadConfig(resume_download=True)
-    )
-    
-    BATCH_SIZE = 10000
-    batch_data = []
-    batch_num = 0
-    total_count = 0
-    
-    print(f"Processing in batches of {BATCH_SIZE:,} papers...\n")
-    
-    for item in stream:
-        batch_data.append(item)
-        total_count += 1
+        if self.dataset_exists(dataset_name):
+            logger.info(f"✓ ArXiv already downloaded at {save_path}")
+            return load_from_disk(str(save_path))
         
-        if total_count % 1000 == 0:
-            print(f"  Downloaded: {total_count:,} papers...", end='\r')
+        logger.info("\n" + "="*80)
+        logger.info("DOWNLOADING ARXIV (MEMORY-OPTIMIZED)")
+        logger.info("="*80 + "\n")
         
-        if len(batch_data) >= BATCH_SIZE:
-            print(f"\n  Saving batch {batch_num}...")
-            batch_dataset = Dataset.from_dict({
-                key: [item[key] for item in batch_data]
-                for key in batch_data[0].keys()
-            })
-            batch_dataset = batch_dataset.map(
-                lambda x: {**x, 'domain': 'pubmed'},
-                desc=f"Labeling batch {batch_num}"
-            )
-            batch_path = f"./pubmed_batch_{batch_num:03d}"
-            batch_dataset.save_to_disk(batch_path)
-            print(f"  ✓ Batch {batch_num} saved")
-            
-            batch_data = []
-            batch_num += 1
-    
-    if batch_data:
-        print(f"\n  Saving final batch {batch_num}...")
-        batch_dataset = Dataset.from_dict({
-            key: [item[key] for item in batch_data]
-            for key in batch_data[0].keys()
-        })
-        batch_dataset = batch_dataset.map(
-            lambda x: {**x, 'domain': 'pubmed'},
-            desc=f"Labeling batch {batch_num}"
-        )
-        batch_path = f"./pubmed_batch_{batch_num:03d}"
-        batch_dataset.save_to_disk(batch_path)
-    
-    print(f"\n✓ Downloaded {total_count:,} papers in {batch_num + 1} batches")
-    
-    # Combine batches
-    print("\nCombining all batches...")
-    batch_datasets = []
-    for i in range(batch_num + 1):
-        batch_path = f"./pubmed_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            batch_datasets.append(load_from_disk(batch_path))
-    
-    combined = concatenate_datasets(batch_datasets)
-    print(f"✓ Combined: {len(combined):,} papers")
-    
-    combined.save_to_disk("./pubmed_dataset")
-    
-    # Clean up
-    for i in range(batch_num + 1):
-        import shutil
-        batch_path = f"./pubmed_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            shutil.rmtree(batch_path)
-    
-    print("\n✓ PubMed saved to: ./pubmed_dataset")
-    print("\nNext: Run: python prepare_datasets.py legal")
-
-
-def download_legal_streaming_batched():
-    """Download Legal dataset using streaming with batched saving."""
-    print("\n" + "="*80)
-    print("DOWNLOADING LEGAL DATASET (MEMORY-OPTIMIZED)")
-    print("="*80)
-    print("Strategy: Download + Save every 5K documents")
-    print("Note: Using 50K subset for balanced dataset")
-    print("="*80 + "\n")
-    
-    # Try multiple legal sources
-    legal_sources = [
-        ("pile-of-law/pile-of-law", "r_legaladvice", True),
-        ("jonathanli/pile-of-law-sample", None, False),
-    ]
-    
-    stream = None
-    for source_name, config, needs_trust in legal_sources:
         try:
-            print(f"Trying: {source_name}...")
-            if config:
-                stream = load_dataset(
-                    source_name,
-                    config,
-                    split="train",
-                    streaming=True,
-                    trust_remote_code=needs_trust,
-                    download_config=DownloadConfig(resume_download=True)
+            # Load with streaming (no num_proc for streaming!)
+            stream = load_dataset(
+                "armanc/scientific_papers",
+                "arxiv",
+                split="train",
+                streaming=True,
+                download_config=DownloadConfig(resume_download=True)
+            )
+            
+            batch_data = []
+            batch_num = 0
+            total_count = 0
+            batch_files = []
+            
+            logger.info(f"Processing in batches of {self.batch_size}...")
+            
+            for idx, example in enumerate(stream):
+                example['domain'] = dataset_name
+                batch_data.append(example)
+                total_count += 1
+                
+                # Save batch
+                if len(batch_data) >= self.batch_size:
+                    batch_file = save_path / f"batch_{batch_num:04d}"
+                    logger.info(f"  Saving batch {batch_num}: papers {total_count-self.batch_size+1}-{total_count}")
+                    
+                    batch_dataset = Dataset.from_dict(
+                        {k: [item[k] for item in batch_data] for k in batch_data[0].keys()}
+                    )
+                    batch_dataset.save_to_disk(str(batch_file))
+                    batch_files.append(batch_file)
+                    
+                    batch_data = []
+                    batch_num += 1
+            
+            # Save final batch
+            if batch_data:
+                batch_file = save_path / f"batch_{batch_num:04d}"
+                logger.info(f"  Saving final batch {batch_num}: {len(batch_data)} papers")
+                batch_dataset = Dataset.from_dict(
+                    {k: [item[k] for item in batch_data] for k in batch_data[0].keys()}
                 )
-            else:
-                stream = load_dataset(
-                    source_name,
-                    split="train",
-                    streaming=True,
-                    download_config=DownloadConfig(resume_download=True)
-                )
-            print(f"✓ Connected to {source_name}")
-            break
+                batch_dataset.save_to_disk(str(batch_file))
+                batch_files.append(batch_file)
+            
+            # Combine all batches
+            logger.info(f"\n  Combining {len(batch_files)} batches...")
+            all_datasets = [load_from_disk(str(f)) for f in batch_files]
+            combined = concatenate_datasets(all_datasets)
+            
+            # Save combined
+            # Clear existing if needed
+            if save_path.exists():
+                shutil.rmtree(save_path)
+            
+            combined.save_to_disk(str(save_path))
+            
+            # Clean up batch files
+            for batch_file in batch_files:
+                if batch_file.exists():
+                    shutil.rmtree(batch_file)
+            
+            logger.info(f"✓ ArXiv downloaded: {len(combined)} papers")
+            return combined
+            
         except Exception as e:
-            print(f"✗ {source_name} failed: {e}")
-            continue
+            logger.error(f"✗ Error downloading ArXiv: {e}")
+            raise
     
-    if stream is None:
-        print("\n✗ Could not connect to any legal dataset source")
-        print("Continuing without legal dataset.")
-        print("You can combine ArXiv + PubMed with: python download_memory_optimized.py combine")
-        return
+    def download_pubmed(self) -> Dataset:
+        """Download PubMed dataset."""
+        dataset_name = 'pubmed'
+        save_path = self.get_dataset_path(dataset_name)
+        
+        if self.dataset_exists(dataset_name):
+            logger.info(f"✓ PubMed already downloaded at {save_path}")
+            return load_from_disk(str(save_path))
+        
+        logger.info("\n" + "="*80)
+        logger.info("DOWNLOADING PUBMED")
+        logger.info("="*80 + "\n")
+        
+        try:
+            stream = load_dataset(
+                "armanc/scientific_papers",
+                "pubmed",
+                split="train",
+                streaming=True,
+                download_config=DownloadConfig(resume_download=True)
+            )
+            
+            batch_data = []
+            batch_num = 0
+            total_count = 0
+            batch_files = []
+            
+            logger.info(f"Processing in batches of {self.batch_size}...")
+            
+            for idx, example in enumerate(stream):
+                example['domain'] = dataset_name
+                batch_data.append(example)
+                total_count += 1
+                
+                if len(batch_data) >= self.batch_size:
+                    batch_file = save_path / f"batch_{batch_num:04d}"
+                    logger.info(f"  Saving batch {batch_num}: papers {total_count-self.batch_size+1}-{total_count}")
+                    batch_dataset = Dataset.from_dict(
+                        {k: [item[k] for item in batch_data] for k in batch_data[0].keys()}
+                    )
+                    batch_dataset.save_to_disk(str(batch_file))
+                    batch_files.append(batch_file)
+                    batch_data = []
+                    batch_num += 1
+            
+            if batch_data:
+                batch_file = save_path / f"batch_{batch_num:04d}"
+                logger.info(f"  Saving final batch {batch_num}: {len(batch_data)} papers")
+                batch_dataset = Dataset.from_dict(
+                    {k: [item[k] for item in batch_data] for k in batch_data[0].keys()}
+                )
+                batch_dataset.save_to_disk(str(batch_file))
+                batch_files.append(batch_file)
+            
+            logger.info(f"\n  Combining {len(batch_files)} batches...")
+            all_datasets = [load_from_disk(str(f)) for f in batch_files]
+            combined = concatenate_datasets(all_datasets)
+            
+            if save_path.exists():
+                shutil.rmtree(save_path)
+            combined.save_to_disk(str(save_path))
+            
+            for batch_file in batch_files:
+                if batch_file.exists():
+                    shutil.rmtree(batch_file)
+            
+            logger.info(f"✓ PubMed downloaded: {len(combined)} papers")
+            return combined
+            
+        except Exception as e:
+            logger.error(f"✗ Error downloading PubMed: {e}")
+            raise
     
-    BATCH_SIZE = 10000
-    MAX_DOCS = 200000
-    batch_data = []
-    batch_num = 0
-    total_count = 0
+    def download_legal(self) -> Dataset:
+        """Download Legal dataset."""
+        dataset_name = 'legal'
+        save_path = self.get_dataset_path(dataset_name)
+        
+        if self.dataset_exists(dataset_name):
+            logger.info(f"✓ Legal already downloaded at {save_path}")
+            return load_from_disk(str(save_path))
+        
+        logger.info("\n" + "="*80)
+        logger.info("DOWNLOADING LEGAL")
+        logger.info("="*80 + "\n")
+        
+        try:
+            try:
+                dataset = load_dataset(
+                    "pile-of-law/pile-of-law",
+                    "r_legaladvice",
+                    split="train",
+                    download_config=DownloadConfig(resume_download=True)
+                )
+            except:
+                logger.warning("Primary legal dataset unavailable, trying alternative...")
+                dataset = load_dataset("jonathanli/pile-of-law-sample", split="train")
+            
+            dataset = dataset.map(lambda x: {**x, 'domain': dataset_name})
+            
+            save_path.mkdir(parents=True, exist_ok=True)
+            dataset.save_to_disk(str(save_path))
+            logger.info(f"✓ Legal downloaded: {len(dataset)} documents")
+            return dataset
+            
+        except Exception as e:
+            logger.error(f"✗ Error downloading Legal: {e}")
+            raise
     
-    print(f"\nProcessing in batches of {BATCH_SIZE:,} documents...")
-    print(f"(Will stop at {MAX_DOCS:,} documents)\n")
+    def download_openwebmath(self) -> Dataset:
+        """Download OpenWebMath dataset."""
+        dataset_name = 'openwebmath'
+        save_path = self.get_dataset_path(dataset_name)
+        
+        if self.dataset_exists(dataset_name):
+            logger.info(f"✓ OpenWebMath already downloaded at {save_path}")
+            return load_from_disk(str(save_path))
+        
+        logger.info("\n" + "="*80)
+        logger.info("DOWNLOADING OPENWEBMATH")
+        logger.info("="*80 + "\n")
+        
+        try:
+            dataset = load_dataset(
+                "open-web-math/open-web-math",
+                split="train",
+                download_config=DownloadConfig(resume_download=True)
+            )
+            
+            dataset = dataset.map(lambda x: {**x, 'domain': dataset_name})
+            
+            save_path.mkdir(parents=True, exist_ok=True)
+            dataset.save_to_disk(str(save_path))
+            logger.info(f"✓ OpenWebMath downloaded: {len(dataset)} documents")
+            return dataset
+            
+        except Exception as e:
+            logger.error(f"✗ Error downloading OpenWebMath: {e}")
+            raise
     
-    for item in stream:
-        # Process to match ArXiv/PubMed format
-        if 'article' in item:
-            processed_item = {**item, 'domain': 'legal'}
-        elif 'text' in item:
-            processed_item = {'article': item['text'], 'domain': 'legal'}
-        else:
-            # Find any text field
-            text_field = next((k for k in item.keys() 
-                             if isinstance(item[k], str) and len(item[k]) > 100), None)
-            if text_field:
-                processed_item = {'article': item[text_field], 'domain': 'legal'}
+    def combine_datasets(self) -> Dataset:
+        """Combine all downloaded datasets."""
+        
+        logger.info("\n" + "="*80)
+        logger.info("COMBINING DATASETS")
+        logger.info("="*80 + "\n")
+        
+        combined_path = Path(COMBINED_DATASET_PATH)
+        combined_path.mkdir(parents=True, exist_ok=True)
+        
+        all_datasets = []
+        
+        for dataset_name in ['arxiv', 'pubmed', 'legal', 'openwebmath']:
+            path = self.get_dataset_path(dataset_name)
+            
+            if not path.exists():
+                logger.warning(f"⚠ {dataset_name} not found at {path}, skipping...")
+                continue
+            
+            try:
+                dataset = load_from_disk(str(path))
+                
+                if 'domain' not in dataset.column_names:
+                    dataset = dataset.map(lambda x: {**x, 'domain': dataset_name})
+                
+                all_datasets.append(dataset)
+                logger.info(f"✓ Loaded {dataset_name}: {len(dataset)} examples")
+                
+            except Exception as e:
+                logger.error(f"✗ Error loading {dataset_name}: {e}")
+                continue
+        
+        if not all_datasets:
+            logger.error("✗ No datasets found to combine!")
+            return None
+        
+        logger.info(f"\nCombining {len(all_datasets)} datasets...")
+        combined = concatenate_datasets(all_datasets)
+        
+        # Clear existing combined dataset if it exists
+        if combined_path.exists():
+            shutil.rmtree(combined_path)
+        
+        combined.save_to_disk(str(combined_path))
+        
+        logger.info(f"✓ Combined dataset saved: {len(combined)} total examples")
+        logger.info(f"  Location: {combined_path}")
+        
+        # Domain distribution
+        logger.info("\nDomain distribution:")
+        domains = combined.unique('domain')
+        for domain in domains:
+            count = len(combined.filter(lambda x: x['domain'] == domain))
+            pct = (count / len(combined)) * 100
+            logger.info(f"  - {domain}: {count:,} ({pct:.1f}%)")
+        
+        return combined
+    
+    def status(self) -> None:
+        """Show download status."""
+        logger.info("\n" + "="*80)
+        logger.info("DATASET STATUS")
+        logger.info("="*80 + "\n")
+        
+        for dataset_name in ['arxiv', 'pubmed', 'legal', 'openwebmath']:
+            path = self.get_dataset_path(dataset_name)
+            if self.dataset_exists(dataset_name):
+                try:
+                    dataset = load_from_disk(str(path))
+                    logger.info(f"✓ {dataset_name.upper()}: {len(dataset):,} examples")
+                except:
+                    logger.info(f"⚠ {dataset_name.upper()}: directory exists but corrupted")
             else:
-                continue  # Skip if no text found
+                logger.info(f"✗ {dataset_name.upper()}: not downloaded")
         
-        batch_data.append(processed_item)
-        total_count += 1
-        
-        if total_count % 500 == 0:
-            print(f"  Downloaded: {total_count:,} documents...", end='\r')
-        
-        # Stop at max
-        if total_count >= MAX_DOCS:
-            print(f"\n✓ Reached {MAX_DOCS:,} documents limit")
-            break
-        
-        # Save batch when full
-        if len(batch_data) >= BATCH_SIZE:
-            print(f"\n  Saving batch {batch_num}...")
-            batch_dataset = Dataset.from_dict({
-                key: [item[key] for item in batch_data]
-                for key in batch_data[0].keys()
-            })
-            
-            batch_path = f"./legal_batch_{batch_num:03d}"
-            batch_dataset.save_to_disk(batch_path)
-            print(f"  ✓ Batch {batch_num} saved")
-            
-            batch_data = []
-            batch_num += 1
-    
-    # Save remaining data
-    if batch_data:
-        print(f"\n  Saving final batch {batch_num}...")
-        batch_dataset = Dataset.from_dict({
-            key: [item[key] for item in batch_data]
-            for key in batch_data[0].keys()
-        })
-        batch_path = f"./legal_batch_{batch_num:03d}"
-        batch_dataset.save_to_disk(batch_path)
-    
-    print(f"\n✓ Downloaded {total_count:,} documents in {batch_num + 1} batches")
-    
-    # Combine batches
-    print("\nCombining all batches...")
-    batch_datasets = []
-    for i in range(batch_num + 1):
-        batch_path = f"./legal_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            batch_datasets.append(load_from_disk(batch_path))
-    
-    combined = concatenate_datasets(batch_datasets)
-    print(f"✓ Combined: {len(combined):,} documents")
-    
-    combined.save_to_disk("./legal_dataset")
-    
-    # Clean up
-    for i in range(batch_num + 1):
-        import shutil
-        batch_path = f"./legal_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            shutil.rmtree(batch_path)
-    
-    print("\n✓ Legal dataset saved to: ./legal_dataset")
-    print("\nNext: Run: python prepare_datasets.py openwebmath")
-
-
-def download_openwebmath_streaming_batched():
-    """Download OpenWebMath dataset using streaming with batched saving."""
-    print("\n" + "="*80)
-    print("DOWNLOADING OPENWEBMATH (MEMORY-OPTIMIZED)")
-    print("="*80)
-    print("Strategy: Download + Save every 10K documents")
-    print("Note: Using 100K subset for balanced dataset")
-    print("OpenWebMath: High-quality mathematical text dataset")
-    print("="*80 + "\n")
-    
-    try:
-        print("Connecting to OpenWebMath dataset...")
-        stream = load_dataset(
-            "open-web-math/open-web-math",
-            split="train",
-            streaming=True,
-            download_config=DownloadConfig(resume_download=True)
-        )
-        print("✓ Connected to OpenWebMath")
-    except Exception as e:
-        print(f"\n✗ Could not connect to OpenWebMath: {e}")
-        print("Continuing without OpenWebMath dataset.")
-        return
-    
-    BATCH_SIZE = 10000
-    MAX_DOCS = 200000
-    batch_data = []
-    batch_num = 0
-    total_count = 0
-    
-    print(f"\nProcessing in batches of {BATCH_SIZE:,} documents...")
-    print(f"(Will stop at {MAX_DOCS:,} documents)\n")
-    
-    for item in stream:
-        # OpenWebMath has 'text' field, convert to 'article'
-        if 'text' in item:
-            processed_item = {'article': item['text'], 'domain': 'openwebmath'}
-        elif 'article' in item:
-            processed_item = {**item, 'domain': 'openwebmath'}
+        combined_path = Path(COMBINED_DATASET_PATH)
+        if combined_path.exists():
+            try:
+                combined = load_from_disk(str(combined_path))
+                logger.info(f"\n✓ COMBINED: {len(combined):,} total examples")
+            except:
+                logger.info(f"\n⚠ COMBINED: directory exists but corrupted")
         else:
-            continue
+            logger.info(f"\n✗ COMBINED: not created")
         
-        batch_data.append(processed_item)
-        total_count += 1
-        
-        if total_count % 1000 == 0:
-            print(f"  Downloaded: {total_count:,} documents...", end='\r')
-        
-        if total_count >= MAX_DOCS:
-            print(f"\n✓ Reached {MAX_DOCS:,} documents limit")
-            break
-        
-        if len(batch_data) >= BATCH_SIZE:
-            print(f"\n  Saving batch {batch_num}...")
-            batch_dataset = Dataset.from_dict({
-                key: [item[key] for item in batch_data]
-                for key in batch_data[0].keys()
-            })
-            batch_path = f"./openwebmath_batch_{batch_num:03d}"
-            batch_dataset.save_to_disk(batch_path)
-            print(f"  ✓ Batch {batch_num} saved")
-            batch_data = []
-            batch_num += 1
-    
-    if batch_data:
-        print(f"\n  Saving final batch {batch_num}...")
-        batch_dataset = Dataset.from_dict({
-            key: [item[key] for item in batch_data]
-            for key in batch_data[0].keys()
-        })
-        batch_path = f"./openwebmath_batch_{batch_num:03d}"
-        batch_dataset.save_to_disk(batch_path)
-    
-    print(f"\n✓ Downloaded {total_count:,} documents in {batch_num + 1} batches")
-    
-    print("\nCombining all batches...")
-    batch_datasets = []
-    for i in range(batch_num + 1):
-        batch_path = f"./openwebmath_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            batch_datasets.append(load_from_disk(batch_path))
-    
-    combined = concatenate_datasets(batch_datasets)
-    combined.save_to_disk("./openwebmath_dataset")
-    
-    for i in range(batch_num + 1):
-        import shutil
-        batch_path = f"./openwebmath_batch_{i:03d}"
-        if os.path.exists(batch_path):
-            shutil.rmtree(batch_path)
-    
-    print("\n✓ OpenWebMath saved to: ./openwebmath_dataset")
-    print("\nNext: python prepare_datasets.py combine")
+        logger.info("\n" + "="*80 + "\n")
 
 
-def combine_datasets():
-    """Combine ArXiv + PubMed datasets."""
-    print("\n" + "="*80)
-    print("COMBINING DATASETS")
-    print("="*80)
-    
-    datasets_to_combine = []
-    
-    if os.path.exists("./arxiv_dataset"):
-        print("Loading ArXiv...")
-        arxiv = load_from_disk("./arxiv_dataset")
-        datasets_to_combine.append(arxiv)
-        print(f"✓ ArXiv: {len(arxiv):,}")
-    else:
-        print("✗ ArXiv not found")
-        return
-    
-    if os.path.exists("./pubmed_dataset"):
-        print("Loading PubMed...")
-        pubmed = load_from_disk("./pubmed_dataset")
-        datasets_to_combine.append(pubmed)
-        print(f"✓ PubMed: {len(pubmed):,}")
-    else:
-        print("✗ PubMed not found")
-        return
-    
-    if os.path.exists("./legal_dataset"):
-        print("Loading legal...")
-        legal = load_from_disk("./legal_dataset")
-        datasets_to_combine.append(legal)
-        print(f"✓ legal: {len(legal):,}")
-    else:
-        print("✗ legal not found")
-        return
-    
-    if os.path.exists("./openwebmath_dataset"):
-        print("Loading openwebmath...")
-        openwebmath = load_from_disk("./openwebmath_dataset")
-        datasets_to_combine.append(openwebmath)
-        print(f"✓ openwebmath: {len(openwebmath):,}")
-    else:
-        print("✗ openwebmath not found")
-        return
-
-    print("\nCombining...")
-    combined = concatenate_datasets(datasets_to_combine)
-    
-    print("Saving combined dataset...")
-    combined.save_to_disk("./combined_dataset")
-    
-    print("\n" + "="*80)
-    print("✓ COMPLETE!")
-    print("="*80)
-    print(f"Total: {len(combined):,} papers")
-    print("Saved to: ./combined_dataset")
-    print("\nRun: python preprocess_v2.py --num-papers 1000")
-    print("="*80)
-
-
-def show_usage():
-    print("\n" + "="*80)
-    print("MEMORY-OPTIMIZED DOWNLOADER")
-    print("="*80)
-    print("\nUsage:")
-    print("  python download_memory_optimized.py arxiv")
-    print("  python download_memory_optimized.py pubmed")
-    print("  python download_memory_optimized.py combine")
-    print("\nSaves in batches of 10K papers to prevent memory issues")
-    print("="*80 + "\n")
-
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
+    """Main entry point."""
+    
     if len(sys.argv) < 2:
-        show_usage()
-        sys.exit(0)
+        print("\nUsage:")
+        print("  python prepare_datasets.py arxiv          # Download ArXiv")
+        print("  python prepare_datasets.py pubmed         # Download PubMed")
+        print("  python prepare_datasets.py legal          # Download Legal")
+        print("  python prepare_datasets.py openwebmath    # Download OpenWebMath")
+        print("  python prepare_datasets.py combine        # Combine all datasets")
+        print("  python prepare_datasets.py status         # Show download status\n")
+        sys.exit(1)
     
     command = sys.argv[1].lower()
+    preparer = DatasetPreparer()
     
     try:
-        if command == "arxiv":
-            download_arxiv_streaming_batched()
-        elif command == "pubmed":
-            download_pubmed_streaming_batched()
-        elif command == "legal":
-            download_legal_streaming_batched()
-        elif command == "openwebmath":
-            download_openwebmath_streaming_batched()
-        elif command == "combine":
-            combine_datasets()
+        if command == 'arxiv':
+            preparer.download_arxiv()
+        elif command == 'pubmed':
+            preparer.download_pubmed()
+        elif command == 'legal':
+            preparer.download_legal()
+        elif command == 'openwebmath':
+            preparer.download_openwebmath()
+        elif command == 'combine':
+            preparer.combine_datasets()
+        elif command == 'status':
+            preparer.status()
         else:
-            print(f"Unknown command: {command}")
-            show_usage()
+            logger.error(f"Unknown command: {command}")
             sys.exit(1)
+    
     except KeyboardInterrupt:
-        print("\n\nInterrupted")
+        logger.info("\n⚠ Download interrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"✗ Error: {e}", exc_info=True)
         sys.exit(1)
 
 
