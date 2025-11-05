@@ -59,37 +59,8 @@ class Model:
         return self.model
     
     def initialize_new_embeddings(self, connector_taxonomy):
-        embedding_layer = self.model.get_input_embeddings()
-        current_vocab_size = len(self.tokenizer)
+        print("No embedding initialization logic set. ")
         
-        with torch.no_grad():
-            existing_embeddings = embedding_layer.weight[:self.original_vocab_size].clone()
-            
-            for token_id in range(self.original_vocab_size, current_vocab_size):
-                token = self.tokenizer.convert_ids_to_tokens(token_id)
-                initialized = False
-                
-                # Try to match connector type
-                for conn_type, example_words in connector_taxonomy.items():
-                    if conn_type.lower() in str(token).lower():
-                        similar_ids = []
-                        for word in example_words[:5]:
-                            word_tokens = self.tokenizer.tokenize(word)
-                            if word_tokens:
-                                word_id = self.tokenizer.convert_tokens_to_ids(word_tokens)
-                                if word_id < self.original_vocab_size:
-                                    similar_ids.append(word_id)
-                        
-                        if similar_ids:
-                            avg_embedding = existing_embeddings[similar_ids].mean(dim=0)
-                            embedding_layer.weight.data[token_id] = avg_embedding
-                            initialized = True
-                            break
-                
-                if not initialized:
-                    embedding_layer.weight.data[token_id] = existing_embeddings.mean(dim=0)
-                    print(f"'{token}' initialized with mean embedding")
-    
     def get_model_info(self):
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)

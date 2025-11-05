@@ -1,83 +1,90 @@
 #!/usr/bin/env python3
 from utils.config import Config
 from pretrain.model import Model
-from pretrain.data_loader import PretrainingDataLoader
 from huggingface_hub import login
 import os
 
-
-def loadModel(config):
+def loadModel(config: Config):
     
-    handler = Model(config)
+    model_handler = Model(config)
     
-    tokenizer = handler.load_tokenizer()
+    tokenizer = model_handler.load_tokenizer()
     
-    special_tokens = config.get_special_tokens()
+    # Add special tokens including connector markup tokens
+    special_tokens = config.get_special_tokens() + ["<connector>", "</connector>"]
     print(f"Tokens to add: {special_tokens}")
-
-    num_added = handler.extend_tokenizer(special_tokens)
+    num_added = model_handler.extend_tokenizer(special_tokens)
     print(f"Added {num_added} tokens")
     print(f"New vocab size: {len(tokenizer):,}")
     
-    handler.load_model()
+    # Load model
+    model_handler.load_model()
     
-    info = handler.get_model_info()
+    def initialize_with_logging(connector_taxonomy):
+        embedding_layer = model_handler.model.get_input_embeddings()
+        current_vocab_size = len(model_handler.tokenizer)
+        fallback_tokens = []
+
+        with torch.no_grad():
+            existing_embeddings = embedding_layer.weight[:model_handler.original_vocab_size].clone()
+            
+            for token_id in range(model_handler.original_vocab_size, current_vocab_size):
+                token = model_handler.tokenizer.convert_ids_to_tokens(token_id)
+                initialized = False
+                
+                for conn_type, example_words in connector_taxonomy.items():
+                    if conn_type.lower() in str(token).lower():
+                        similar_ids = []
+                        for word in example_words[:5]:
+                            word_tokens = model_handler.tokenizer.tokenize(word)
+                            if word_tokens:
+                                word_id = model_handler.tokenizer.convert_tokens_to_ids(word_tokens)
+                                if isinstance(word_id, list):
+                                    word_id = [i for i in word_id if i < model_handler.original_vocab_size]
+                                    similar_ids.extend(word_id)
+                                elif word_id < model_handler.original_vocab_size:
+                                    similar_ids.append(word_id)
+                        
+                        if similar_ids:
+                            avg_embedding = existing_embeddings[similar_ids].mean(dim=0)
+                            embedding_layer.weight.data[token_id] = avg_embedding
+                            initialized = True
+                            break
+                
+                if not initialized:
+                    embedding_layer.weight.data[token_id] = existing_embeddings.mean(dim=0)
+                    fallback_tokens.append(token)
+        
+        if fallback_tokens:
+            print(f"Fallback embeddings used for tokens: {fallback_tokens}")
+
+    model_handler.initialize_new_embeddings = initialize_with_logging
+
+    model_handler.initialize_new_embeddings(config.connector_types)
+    
+    # Show model info
+    info = model_handler.get_model_info()
     print(f"\nTotal parameters: {info['total_parameters']:,}")
     print(f"Device: {info['device']}")
     
-    handler.initialize_new_embeddings(config.connector_types)
+    pretrain_manager = ConnectorPretrainingManager(config, model_handler)
     
-    print("\nModel is ready for training!")
+    print("\n✓ Model ready for connector-aware pretraining!")
     
-    return handler
-
-def loadData(config):
-    """
-    Demonstrates loading the data using the new data loader class.
-    """
-    print("\n" + "="*80)
-    print("LOADING DATA")
-    print("="*80)
-    
-    data_loader = PretrainingDataLoader(config)
-    
-    # Load the preprocessed data (split into train/test)
-    # This loads from the './checkpoints' directory by default
-    training_data_dict = data_loader.load_preprocessed_data_for_training(test_split_size=0.01)
-    
-    if training_data_dict:
-        print(f"\n✓ Successfully loaded training data.")
-        print(f"  Training samples: {len(training_data_dict['train']):,}")
-        print(f"  Test samples: {len(training_data_dict['test']):,}")
-        # print("\nSample (from train split):")
-        # print(training_data_dict['train'][0])
-    else:
-        print("\n✗ Failed to load training data. Please run preprocessing first.")
-    
-    eval_dataset = data_loader.load_evaluation_data("logiqa")
-    
-    if eval_dataset:
-        print(f"\n✓ Successfully loaded LogiQA evaluation data.")
-        print(f"  LogiQA samples: {len(eval_dataset):,}")
-        # print("\nSample (from LogiQA):")
-        # print(eval_dataset[0])
-    else:
-        print("\n✗ Failed to load LogiQA evaluation data.")
-        
-    print("="*80)
-    return training_data_dict, eval_dataset
+    return model_handler, pretrain_manager
 
 
 def main():
+    # HuggingFace login
     token = os.environ.get('HF_TOKEN')
-    login(token = token)
+    if token:
+        login(token=token)
+    
     config = Config()
-
-    modelHandel = loadModel(config)
     
-    training_data, eval_data = loadData(config)
+    model_handler, pretrain_manager = loadModel(config)
     
-    print("\nNext step: Initialize and run the Trainer.")
+    print("\n✓ Main pipeline setup complete. Ready to prepare datasets and train.")
 
 
 if __name__ == "__main__":
