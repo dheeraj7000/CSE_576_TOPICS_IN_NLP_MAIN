@@ -1,5 +1,9 @@
 connector_embed/
 dataset/
+.cache/
+output/
+
+check.py
 
 *.zip
 *.Identifier

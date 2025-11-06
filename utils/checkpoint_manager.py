@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-checkpoint_manager.py - CRD UPDATED: Checkpoint Management for Discourse-Aware Preprocessing
+checkpoint_manager.py - UPDATED FOR INTEGRATION
 
-Manages checkpoint I/O for the CRD preprocessing pipeline.
+Checkpoint Management for Connector-Aware Preprocessing.
+Compatible with config_gpt2_cuda.py and data_loader.py.
 
 Key responsibilities:
 - Save preprocessed papers with connector masks to parquet format
@@ -10,9 +11,6 @@ Key responsibilities:
 - Resume from last checkpoint
 - Compute aggregate statistics across checkpoints
 - Validate connector_mask integrity
-
-Format: Exact tag format <connector type="X"> word </connector>
-Weight: 1.1x (learnable - initialized conservatively, model optimizes via training)
 """
 
 import os
@@ -24,13 +22,23 @@ from typing import List, Dict, Tuple, Optional
 
 import pandas as pd
 
-from config import (
-    CHECKPOINT_DIR,
-    CHECKPOINT_SIZE,
-    SAVE_TEXT_PREVIEW,
-    PREVIEW_LENGTH,
-    CONNECTOR_ATTENTION_WEIGHT,
-)
+# Updated imports for integration
+try:
+    # Try to import from config module
+    from utils.config import Config
+    config = Config()
+    CHECKPOINT_DIR = config.checkpoint_dir
+    CHECKPOINT_SIZE = config.checkpoint_size
+    SAVE_TEXT_PREVIEW = config.save_text_preview
+    PREVIEW_LENGTH = config.preview_length
+    CONNECTOR_ATTENTION_WEIGHT = config.connector_attention_weight
+except ImportError:
+    # Fallback to default values
+    CHECKPOINT_DIR = "./data_splits"
+    CHECKPOINT_SIZE = 1000
+    SAVE_TEXT_PREVIEW = True
+    PREVIEW_LENGTH = 1000
+    CONNECTOR_ATTENTION_WEIGHT = 1.1
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,13 +48,15 @@ logger = logging.getLogger(__name__)
 # DIRECTORY MANAGEMENT
 # ============================================================================
 
-def ensure_checkpoint_dir(checkpoint_dir: str = CHECKPOINT_DIR):
+def ensure_checkpoint_dir(checkpoint_dir: str = None):
     """
     Create checkpoint directory if it doesn't exist.
     
     Args:
-        checkpoint_dir: Path to checkpoint directory
+        checkpoint_dir: Path to checkpoint directory (uses config default if None)
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     os.makedirs(checkpoint_dir, exist_ok=True)
     logger.info(f"✓ Checkpoint directory ready: {checkpoint_dir}")
@@ -59,19 +69,19 @@ def ensure_checkpoint_dir(checkpoint_dir: str = CHECKPOINT_DIR):
 def save_checkpoint(
     papers: List[Dict],
     checkpoint_id: int,
-    checkpoint_dir: str = CHECKPOINT_DIR
+    checkpoint_dir: str = None
 ) -> str:
     """
     Save preprocessed papers to checkpoint file (parquet format).
     
-    CRD CRITICAL: Preserves connector_mask field for training.
+    CRITICAL: Preserves connector_mask field for training.
     
     Checkpoint structure (parquet columns):
     - doc_id: Document identifier
     - domain: Source domain (arxiv, pubmed, legal, openwebmath)
     - input_ids: Token IDs
     - attention_mask: Standard attention mask (1/0)
-    - connector_mask: CRITICAL - Connector attention weights (0.0/1.0/1.1)
+    - connector_mask: CRITICAL - Connector attention weights (1.0/boost_factor)
     - connector_count: Number of connectors in paper
     - connector_types: List of connector type names
     - connector_words: List of actual connector strings
@@ -87,6 +97,8 @@ def save_checkpoint(
     Returns:
         Path to saved checkpoint file
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     ensure_checkpoint_dir(checkpoint_dir)
     
@@ -99,6 +111,7 @@ def save_checkpoint(
     if missing_mask:
         logger.warning(f"⚠ {len(missing_mask)} papers missing connector_mask")
         for p in missing_mask:
+            # Default: all 1.0 (no boost)
             p['connector_mask'] = [1.0] * len(p.get('input_ids', []))
     
     # Create dataframe
@@ -123,7 +136,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     checkpoint_id: int,
-    checkpoint_dir: str = CHECKPOINT_DIR
+    checkpoint_dir: str = None
 ) -> pd.DataFrame:
     """
     Load a single checkpoint file.
@@ -137,6 +150,8 @@ def load_checkpoint(
     Returns:
         DataFrame with papers
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     checkpoint_path = os.path.join(
         checkpoint_dir,
@@ -161,11 +176,12 @@ def load_checkpoint(
     return df
 
 
-def load_all_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR) -> pd.DataFrame:
+def load_all_checkpoints(checkpoint_dir: str = None) -> pd.DataFrame:
     """
     Load all checkpoints and concatenate into single dataframe.
     
     Used during training to load complete preprocessed dataset.
+    Compatible with PretrainingDataLoader in data_loader.py.
     
     Args:
         checkpoint_dir: Path to checkpoint directory
@@ -173,6 +189,8 @@ def load_all_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR) -> pd.DataFrame:
     Returns:
         DataFrame with all papers from all checkpoints
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     # Find all checkpoint files
     checkpoint_files = sorted(glob.glob(
@@ -217,7 +235,7 @@ def load_all_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR) -> pd.DataFrame:
 # CHECKPOINT TRACKING
 # ============================================================================
 
-def get_last_checkpoint(checkpoint_dir: str = CHECKPOINT_DIR) -> Tuple[int, int]:
+def get_last_checkpoint(checkpoint_dir: str = None) -> Tuple[int, int]:
     """
     Get the ID of the last saved checkpoint and total papers processed.
     
@@ -229,6 +247,8 @@ def get_last_checkpoint(checkpoint_dir: str = CHECKPOINT_DIR) -> Tuple[int, int]
     Returns:
         Tuple of (last_checkpoint_id, total_papers_processed)
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     checkpoint_files = sorted(glob.glob(
         os.path.join(checkpoint_dir, "checkpoint_*.parquet")
@@ -258,11 +278,11 @@ def get_last_checkpoint(checkpoint_dir: str = CHECKPOINT_DIR) -> Tuple[int, int]
 # CHECKPOINT STATISTICS
 # ============================================================================
 
-def get_checkpoint_stats(checkpoint_dir: str = CHECKPOINT_DIR) -> Dict:
+def get_checkpoint_stats(checkpoint_dir: str = None) -> Dict:
     """
     Compute aggregate statistics across all checkpoints.
     
-    CRD STATISTICS: Includes connector-specific metrics.
+    Includes connector-specific metrics.
     
     Returns:
         Dict with statistics:
@@ -273,6 +293,8 @@ def get_checkpoint_stats(checkpoint_dir: str = CHECKPOINT_DIR) -> Dict:
         - connector_density: Percentage of tokens that are connectors
         - connector_type_distribution: Breakdown by type
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     try:
         df = load_all_checkpoints(checkpoint_dir)
@@ -282,10 +304,10 @@ def get_checkpoint_stats(checkpoint_dir: str = CHECKPOINT_DIR) -> Dict:
     
     stats = {
         'total_papers': len(df),
-        'total_tokens': df['token_count'].sum(),
-        'total_connectors': df['connector_count'].sum() if 'connector_count' in df.columns else 0,
-        'avg_tokens_per_paper': df['token_count'].mean() if len(df) > 0 else 0,
-        'avg_connectors_per_paper': df['connector_count'].mean() if 'connector_count' in df.columns and len(df) > 0 else 0,
+        'total_tokens': int(df['token_count'].sum()) if 'token_count' in df.columns else 0,
+        'total_connectors': int(df['connector_count'].sum()) if 'connector_count' in df.columns else 0,
+        'avg_tokens_per_paper': float(df['token_count'].mean()) if 'token_count' in df.columns and len(df) > 0 else 0.0,
+        'avg_connectors_per_paper': float(df['connector_count'].mean()) if 'connector_count' in df.columns and len(df) > 0 else 0.0,
     }
     
     # Connector density
@@ -315,7 +337,7 @@ def get_checkpoint_stats(checkpoint_dir: str = CHECKPOINT_DIR) -> Dict:
     return stats
 
 
-def save_metadata(metadata: Dict, checkpoint_dir: str = CHECKPOINT_DIR):
+def save_metadata(metadata: Dict, checkpoint_dir: str = None):
     """
     Save preprocessing metadata (statistics, parameters, etc.).
     
@@ -323,6 +345,8 @@ def save_metadata(metadata: Dict, checkpoint_dir: str = CHECKPOINT_DIR):
         metadata: Dict with metadata to save
         checkpoint_dir: Path to checkpoint directory
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     ensure_checkpoint_dir(checkpoint_dir)
     
@@ -338,12 +362,14 @@ def save_metadata(metadata: Dict, checkpoint_dir: str = CHECKPOINT_DIR):
 # CHECKPOINT STATUS
 # ============================================================================
 
-def print_checkpoint_status(checkpoint_dir: str = CHECKPOINT_DIR):
+def print_checkpoint_status(checkpoint_dir: str = None):
     """
     Print status of all checkpoints.
     
     Includes validation of connector_mask field.
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     logger.info("\n" + "="*80)
     logger.info("CHECKPOINT STATUS")
@@ -354,7 +380,7 @@ def print_checkpoint_status(checkpoint_dir: str = CHECKPOINT_DIR):
     ))
     
     if not checkpoint_files:
-        logger.info("✗ No checkpoints found")
+        logger.info(f"✗ No checkpoints found in {checkpoint_dir}")
         logger.info("="*80 + "\n")
         return
     
@@ -371,8 +397,8 @@ def print_checkpoint_status(checkpoint_dir: str = CHECKPOINT_DIR):
             filename = os.path.basename(checkpoint_file)
             
             papers = len(df)
-            tokens = df['token_count'].sum() if 'token_count' in df.columns else 0
-            connectors = df['connector_count'].sum() if 'connector_count' in df.columns else 0
+            tokens = int(df['token_count'].sum()) if 'token_count' in df.columns else 0
+            connectors = int(df['connector_count'].sum()) if 'connector_count' in df.columns else 0
             
             # Validate connector_mask
             has_mask = 'connector_mask' in df.columns
@@ -394,7 +420,8 @@ def print_checkpoint_status(checkpoint_dir: str = CHECKPOINT_DIR):
     if total_papers > 0:
         logger.info(f"  Avg tokens/paper: {total_tokens/total_papers:.0f}")
         logger.info(f"  Avg connectors/paper: {total_connectors/total_papers:.1f}")
-        logger.info(f"  Connector density: {total_connectors/total_tokens*100:.2f}%")
+        if total_tokens > 0:
+            logger.info(f"  Connector density: {total_connectors/total_tokens*100:.2f}%")
     
     # Connector mask validation
     if has_connector_mask:
@@ -418,19 +445,23 @@ def print_checkpoint_status(checkpoint_dir: str = CHECKPOINT_DIR):
 # VALIDATION
 # ============================================================================
 
-def validate_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR) -> bool:
+def validate_checkpoints(checkpoint_dir: str = None) -> bool:
     """
-    Validate all checkpoints for CRD requirements.
+    Validate all checkpoints for training requirements.
     
     Checks:
     - All checkpoints exist and are readable
     - connector_mask field present
     - connector_count field present
     - connector_types field present
+    - input_ids field present
+    - attention_mask field present
     
     Returns:
         True if all valid, False otherwise
     """
+    if checkpoint_dir is None:
+        checkpoint_dir = CHECKPOINT_DIR
     
     try:
         df = load_all_checkpoints(checkpoint_dir)
@@ -438,15 +469,53 @@ def validate_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR) -> bool:
         logger.error(f"✗ Could not load checkpoints: {e}")
         return False
     
-    required_fields = ['connector_mask', 'connector_count', 'connector_types', 'input_ids']
-    missing_fields = [f for f in required_fields if f not in df.columns]
+    required_fields = ['input_ids', 'attention_mask']
+    recommended_fields = ['connector_mask', 'connector_count', 'connector_types']
     
-    if missing_fields:
-        logger.error(f"✗ Missing required fields: {missing_fields}")
+    missing_required = [f for f in required_fields if f not in df.columns]
+    missing_recommended = [f for f in recommended_fields if f not in df.columns]
+    
+    if missing_required:
+        logger.error(f"✗ Missing required fields: {missing_required}")
         return False
     
-    logger.info("✓ All checkpoints valid for CRD training")
+    if missing_recommended:
+        logger.warning(f"⚠ Missing recommended fields: {missing_recommended}")
+        logger.warning("  Training will work but connector boosting may not be optimal")
+    
+    logger.info("✓ All checkpoints valid for training")
     return True
+
+
+# ============================================================================
+# INTEGRATION HELPERS
+# ============================================================================
+
+def get_config_info() -> Dict:
+    """
+    Get configuration information for checkpoint manager.
+    
+    Returns:
+        Dict with config settings
+    """
+    try:
+        from utils.config import Config
+        config = Config()
+        return {
+            'checkpoint_dir': config.checkpoint_dir,
+            'checkpoint_size': config.checkpoint_size,
+            'boost_factor': config.boost_factor,
+            'model_name': config.model_name,
+            'device': config.device
+        }
+    except ImportError:
+        return {
+            'checkpoint_dir': CHECKPOINT_DIR,
+            'checkpoint_size': CHECKPOINT_SIZE,
+            'boost_factor': CONNECTOR_ATTENTION_WEIGHT,
+            'model_name': 'unknown',
+            'device': 'unknown'
+        }
 
 
 # ============================================================================
@@ -455,8 +524,14 @@ def validate_checkpoints(checkpoint_dir: str = CHECKPOINT_DIR) -> bool:
 
 if __name__ == "__main__":
     logger.info("\n" + "="*80)
-    logger.info("CHECKPOINT MANAGER - CRD TEST")
+    logger.info("CHECKPOINT MANAGER - INTEGRATION TEST")
     logger.info("="*80)
+    
+    # Show config
+    logger.info("\n[Config Info]")
+    config_info = get_config_info()
+    for key, value in config_info.items():
+        logger.info(f"  {key}: {value}")
     
     # Test 1: Directory creation
     logger.info("\n[Test 1] Checkpoint directory")
@@ -476,9 +551,23 @@ if __name__ == "__main__":
             logger.info(f"  Papers: {stats.get('total_papers', 0):,}")
             logger.info(f"  Tokens: {stats.get('total_tokens', 0):,}")
             logger.info(f"  Connectors: {stats.get('total_connectors', 0):,}")
+            logger.info(f"  Density: {stats.get('connector_density', 0)*100:.2f}%")
         else:
             logger.info("ℹ No checkpoints to compute stats from")
     except Exception as e:
         logger.info(f"ℹ No checkpoints yet: {e}")
     
-    logger.info("\n" + "="*80 + "\n")
+    # Test 4: Validation
+    logger.info("\n[Test 4] Validation")
+    try:
+        valid = validate_checkpoints()
+        if valid:
+            logger.info("✓ Checkpoints valid for training")
+        else:
+            logger.info("⚠ Checkpoints need fixes")
+    except FileNotFoundError:
+        logger.info("ℹ No checkpoints to validate")
+    
+    logger.info("\n" + "="*80)
+    logger.info("✓ Integration test complete")
+    logger.info("="*80 + "\n")

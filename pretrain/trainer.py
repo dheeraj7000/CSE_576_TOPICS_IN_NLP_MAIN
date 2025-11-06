@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-connector_training.py (FIXED)
+trainer.py (UPDATED)
 
-Corrected implementation where:
-- Default mask value = 1
-- Connector token mask value = 2
+Connector-aware training with minimal changes to existing code.
+Added integration with ConnectorDataCollatorWithMaskCreation from data_loader.py.
 """
 
 import re
@@ -22,7 +21,7 @@ from datasets import Dataset as HFDataset
 
 
 # ============================================================================
-# Enhanced Connector Annotator (FIXED)
+# Enhanced Connector Annotator (EXISTING - UNCHANGED)
 # ============================================================================
 
 class ConnectorAnnotator:
@@ -113,7 +112,7 @@ class ConnectorAnnotator:
 
 
 # ============================================================================
-# Custom Loss Function (FIXED)
+# Custom Loss Function (EXISTING - UNCHANGED)
 # ============================================================================
 
 class ConnectorAwareLoss(nn.Module):
@@ -191,7 +190,7 @@ class ConnectorAwareLoss(nn.Module):
 
 
 # ============================================================================
-# Custom Data Collator (UNCHANGED)
+# Custom Data Collator (EXISTING - UNCHANGED)
 # ============================================================================
 
 class ConnectorAwareDataCollator:
@@ -233,7 +232,7 @@ class ConnectorAwareDataCollator:
 
 
 # ============================================================================
-# Custom Trainer (UNCHANGED)
+# Custom Trainer (EXISTING - UNCHANGED)
 # ============================================================================
 
 class ConnectorAwareTrainer(Trainer):
@@ -248,7 +247,7 @@ class ConnectorAwareTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.loss_fn = loss_fn
     
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Override to use custom loss"""
         connector_mask = inputs.pop("connector_mask", None)
         labels = inputs.get("labels")
@@ -271,24 +270,27 @@ class ConnectorAwareTrainer(Trainer):
 
 
 # ============================================================================
-# Main Pretraining Manager (UPDATED)
+# Main Pretraining Manager (UPDATED WITH MINIMAL CHANGES)
 # ============================================================================
 
 class ConnectorPretrainingManager:
     """
     Main class for managing connector-aware pretraining.
     
-    FIXED: Now uses correct masking (1 for normal, 2 for connectors)
+    UPDATED: Now uses ConnectorDataCollatorWithMaskCreation from data_loader.py
     """
     
-    def __init__(self, config, model_handler):
+    def __init__(self, config, model_handler, use_new_collator: bool = True):
         """
         Args:
             config: Your Config instance
             model_handler: Your ConnectorModelHandler instance
+            use_new_collator: If True, uses ConnectorDataCollatorWithMaskCreation
+                             If False, uses original ConnectorAwareDataCollator
         """
         self.config = config
         self.model_handler = model_handler
+        self.use_new_collator = use_new_collator
         
         # Initialize components
         self.annotator = ConnectorAnnotator(config.connector_types)
@@ -296,10 +298,14 @@ class ConnectorPretrainingManager:
         self.trainer = None
         
         print("\n" + "=" * 70)
-        print("CONNECTOR PRETRAINING MANAGER (FIXED)")
+        print("CONNECTOR PRETRAINING MANAGER")
         print("=" * 70)
         print(f"Model: {config.model_name}")
-        print(f"Masking: 1 (default) → 2 (connectors)")
+        print(f"Enhanced Loss: Yes")
+        if use_new_collator:
+            print(f"Data Collator: ConnectorDataCollatorWithMaskCreation (NEW)")
+        else:
+            print(f"Data Collator: ConnectorAwareDataCollator (ORIGINAL)")
         print("=" * 70)
     
     def prepare_trainer(
@@ -309,6 +315,7 @@ class ConnectorPretrainingManager:
         output_dir: str = "./output/connector_model",
         use_amplification: bool = True,
         amplification_strength: float = 1.2,
+        boost_factor: float = 1.1,  # NEW: for new collator
         num_epochs: int = 2,
         batch_size: int = 2,
         learning_rate: float = 5e-6
@@ -316,12 +323,15 @@ class ConnectorPretrainingManager:
         """
         Prepare trainer with custom loss and data collator.
         
+        UPDATED: Can now use either old or new data collator.
+        
         Args:
             train_dataset: Training dataset (tokenized)
             eval_dataset: Eval dataset (tokenized)
             output_dir: Where to save checkpoints
             use_amplification: Enable additional amplification
             amplification_strength: Additional amplification factor
+            boost_factor: Boost factor for new collator (1.0 = no boost, 1.1 = 10% boost)
             num_epochs: Number of epochs
             batch_size: Per-device batch size
             learning_rate: Learning rate
@@ -333,12 +343,33 @@ class ConnectorPretrainingManager:
             amplification_strength=amplification_strength
         )
         
-        # Create data collator
-        data_collator = ConnectorAwareDataCollator(
-            tokenizer=self.model_handler.tokenizer,
-            annotator=self.annotator,
-            max_length=getattr(self.config, 'max_length', 2048)
-        )
+        # Create data collator (NEW OR OLD)
+        if self.use_new_collator:
+            # NEW: Use ConnectorDataCollatorWithMaskCreation from data_loader.py
+            print("\n✓ Using new data collator (on-the-fly mask creation)")
+            
+            # Import here to avoid circular dependency
+            try:
+                from data_loader import ConnectorDataCollatorWithMaskCreation
+                
+                data_collator = ConnectorDataCollatorWithMaskCreation(
+                    tokenizer=self.model_handler.tokenizer,
+                    pad_token_id=self.model_handler.tokenizer.pad_token_id,
+                    boost_factor=boost_factor
+                )
+            except ImportError:
+                print("⚠ Could not import ConnectorDataCollatorWithMaskCreation")
+                print("  Falling back to original collator")
+                self.use_new_collator = False
+        
+        if not self.use_new_collator:
+            # ORIGINAL: Use ConnectorAwareDataCollator
+            print("\n✓ Using original data collator")
+            data_collator = ConnectorAwareDataCollator(
+                tokenizer=self.model_handler.tokenizer,
+                annotator=self.annotator,
+                max_length=getattr(self.config, 'max_length', 2048)
+            )
         
         # Training arguments
         training_args = TrainingArguments(
@@ -386,10 +417,16 @@ class ConnectorPretrainingManager:
         
         print("\n✓ Trainer prepared")
         print(f"   Base weight (normal tokens): 1x")
-        print(f"   Connector weight: 2x")
+        if self.use_new_collator:
+            print(f"   Connector boost factor: {boost_factor}x")
+        else:
+            print(f"   Connector weight: 2x")
         if use_amplification:
             print(f"   Additional amplification: {amplification_strength}x")
-            print(f"   Effective connector weight: {2.0 * amplification_strength}x")
+            if self.use_new_collator:
+                print(f"   Effective connector weight: {boost_factor * amplification_strength}x")
+            else:
+                print(f"   Effective connector weight: {2.0 * amplification_strength}x")
         else:
             print(f"   Additional amplification: Disabled")
         print(f"   Batch size: {batch_size}")
