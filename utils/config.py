@@ -1,104 +1,110 @@
 #!/usr/bin/env python3
 """
-config.py - OPTIMIZED FOR LLAMA-3.2-3B ON CUDA
+config.py - MERGED & OPTIMIZED FOR LLAMA-3.2-3B ON CUDA
 
-Configuration for connector-aware pretraining on Llama 3.2 3B.
-Uses the actual Llama tokenizer (meta-llama/Llama-3.2-3B-Instruct).
+Combines best of both:
+- Uploaded config.py: Complete connector patterns, discourse-aware settings
+- Query config.py: CUDA optimization, cleaner structure
+
+TAG FORMAT: <connector type="x">word</connector>
+CONNECTOR TYPES: Causal, Adversative, Temporal, Conditional, Conclusive, Additive
 """
 
 import os
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field, asdict
 
+
 @dataclass
 class Config:
     """
     Configuration class for connector-aware pretraining.
-    OPTIMIZED FOR: Llama 3.2 3B on CUDA
+    OPTIMIZED FOR: Llama 3.2 3B on CUDA with discourse-aware features
     """
     
     # ========== MODEL CONFIGURATION (LLAMA 3.2 3B ON CUDA) ==========
-    model_name: str = "meta-llama/Llama-3.2-3B"  # Actual Llama 3.2 3B model
+    model_name: str = "meta-llama/Llama-3.2-3B"
     device: str = "cuda"  # Force CUDA
-    torch_dtype: str = "float32"  # FP32 for stability
+    torch_dtype: str = "bfloat16"  # Better stability for Llama
     
     # ========== CONNECTOR BOOSTING ==========
-    use_connector_boost: bool = True  # Enable architectural boosting
+    use_connector_boost: bool = True
     boost_factor: float = 1.1  # Hidden state multiplication factor
     
     # ========== DISCOURSE-AWARE ATTENTION ==========
     use_discourse_attention: bool = True
-    attention_modification_type: str = "pre_softmax"
-    discourse_attention_scaling: float = 1.1
+    attention_modification_type: str = "pre_softmax"  # Apply scaling BEFORE softmax
+    discourse_attention_scaling: float = 1.1  # Conservative weight
     connector_attention_weight: float = 1.1
     
-    # ========== TAG FORMAT ==========
-    tag_format: str = '<connector type="{}">'
-    opening_tag_format: str = '<connector type="{}">'
+    # ========== TAG FORMAT (CORRECT FORMAT) ==========
+    tag_format: str = '<connector type="{type}">{word}</connector>'
+    opening_tag_format: str = '<connector type="{type}">'
     closing_tag: str = '</connector>'
     
-    # ========== LORA SETTINGS (OPTIONAL FOR LLAMA-3.2-3B) ==========
+    # ========== LORA SETTINGS ==========
     use_lora: bool = False  # Llama 3.2 3B is small enough for full fine-tuning
-    lora_r: int = 8
-    lora_alpha: int = 16
+    lora_r: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.1
     lora_target_modules: List[str] = field(default_factory=lambda: [
-        "q_proj", "v_proj", "k_proj", "o_proj",  # Attention projections
-        "gate_proj", "up_proj", "down_proj"       # Feed-forward projections
+        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
+        "gate_proj", "up_proj", "down_proj"       # FFN
     ])
     
-    # ========== CONNECTOR TYPES ==========
+    # ========== CONNECTOR TYPES (COMPLETE) ==========
     connector_types: Dict[str, List[str]] = field(default_factory=lambda: {
-        'CAUSAL': [
+        'causal': [
             'because', 'since', 'as', 'for', 'therefore', 'thus',
             'hence', 'consequently', 'accordingly', 'as a result',
             'due to', 'owing to', 'so that', 'in order to'
         ],
-        'ADVERSATIVE': [
+        'adversative': [
             'but', 'however', 'yet', 'whereas', 'while', 'although',
             'though', 'despite', 'in spite of', 'nevertheless',
-            'nonetheless', 'on the other hand', 'in contlrast'
+            'nonetheless', 'on the other hand', 'in contrast'
         ],
-        'TEMPORAL': [
+        'temporal': [
             'when', 'while', 'as', 'whenever', 'before', 'after',
             'meanwhile', 'then', 'first', 'second', 'finally',
             'eventually', 'ultimately', 'during', 'throughout'
         ],
-        'CONDITIONAL': [
+        'conditional': [
             'if', 'when', 'whenever', 'once', 'assuming',
             'provided that', 'given that', 'in case', 'unless'
         ],
-        'CONCLUSIVE': [
+        'conclusive': [
             'therefore', 'thus', 'hence', 'so', 'in conclusion',
             'to conclude', 'in summary', 'to summarize', 'in short',
             'overall', 'in general', 'finally', 'ultimately'
         ],
-        'ADDITIVE': [
+        'additive': [
             'and', 'also', 'too', 'moreover', 'furthermore',
             'in addition', 'besides', 'likewise', 'similarly',
             'for example', 'for instance', 'such as', 'particularly'
         ]
     })
     
-    # ========== OPTIMIZATION SETTINGS (CUDA OPTIMIZED) ==========
-    use_flash_attention: bool = False  # Not needed for Llama 3.2 3B
+    # ========== OPTIMIZATION SETTINGS ==========
+    use_flash_attention: bool = True
     flash_attention_version: int = 2
     use_fsdp: bool = False  # Single GPU
     use_deepspeed: bool = False  # Single GPU
-    gradient_checkpointing: bool = False  # Llama 3.2 3B is small enough
+    gradient_checkpointing: bool = False  # Not needed for Llama 3.2 3B
     
-    # ========== TRAINING CONFIGURATION (OPTIMIZED FOR SPEED) ==========
-    num_train_epochs: int = 1  # Single epoch
-    per_device_train_batch_size: int = 4  # Adjusted for Llama (more memory intensive)
-    gradient_accumulation_steps: int = 8  # Effective batch = 32
-    learning_rate: float = 5e-5  # Standard LR for Llama
-    warmup_ratio: float = 0.1  # 10% warmup
+    # ========== TRAINING CONFIGURATION (CUDA OPTIMIZED) ==========
+    num_train_epochs: int = 1
+    per_device_train_batch_size: int = 4
+    per_device_eval_batch_size: int = 4
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 5e-6  # Conservative for fine-tuning
+    warmup_ratio: float = 0.1
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
-    # ========== SEQUENCE CONFIGURATION (LLAMA OPTIMIZED) ==========
-    max_sequence_length: int = 8192  # Llama 3.2 context length
-    max_length: int = 8192  # For compatibility
+    # ========== SEQUENCE CONFIGURATION ==========
+    max_sequence_length: int = 8192  # Llama 3.2 context
+    max_length: int = 8192
     
     # ========== DATASET CONFIGURATION ==========
     combined_dataset_path: str = "./combined_dataset_sample"
@@ -114,15 +120,16 @@ class Config:
     save_text_preview: bool = True
     preview_length: int = 500
     log_level: str = "INFO"
-    logging_steps: int = 50  # Log more frequently
-    eval_steps: int = 500  # Eval more frequently
-    save_steps: int = 1000  # Save more frequently
+    logging_steps: int = 50
+    eval_steps: int = 500
+    save_steps: int = 1000
     
     # ========== PERFORMANCE ==========
     num_workers: int = 4
     batch_size: int = 10000
-    dataloader_pin_memory: bool = True  # Faster data loading on CUDA
-    dataloader_prefetch_factor: int = 2  # Prefetch batches
+    dataloader_num_workers: int = 0  # CRITICAL: No multiprocessing for data loading
+    dataloader_pin_memory: bool = False  # CRITICAL: False for safety
+    dataloader_prefetch_factor: int = 2
     
     # ========== HELPER METHODS ==========
     
@@ -130,16 +137,16 @@ class Config:
         """
         Get special tokens for tokenizer.
         
+        Format: <connector type="TYPE">word</connector>
+        
         Returns:
-            List of special tokens including:
-            - Opening tags: <connector type="causal">, <connector type="conclusive">, etc.
-            - Closing tag: </connector>
+            List of special tokens
         """
         tokens = []
         
         # Opening tags (one per connector type)
         for conn_type in self.connector_types.keys():
-            tokens.append(self.opening_tag_format.format(conn_type))
+            tokens.append(self.opening_tag_format.format(type=conn_type.upper()))
         
         # Closing tag
         tokens.append(self.closing_tag)
@@ -170,7 +177,7 @@ class Config:
         return True
     
     def to_dict(self) -> dict:
-        """Convert Config to dictionary for model compatibility."""
+        """Convert Config to dictionary."""
         return asdict(self)
 
     def print_summary(self):
@@ -199,6 +206,12 @@ class Config:
         if self.use_connector_boost:
             print(f"  Boost factor: {self.boost_factor}x")
         
+        print(f"\nDiscourse Attention:")
+        print(f"  Enabled: {self.use_discourse_attention}")
+        if self.use_discourse_attention:
+            print(f"  Type: {self.attention_modification_type}")
+            print(f"  Scaling: {self.discourse_attention_scaling}x")
+        
         print(f"\nLoRA:")
         print(f"  Enabled: {self.use_lora}")
         if self.use_lora:
@@ -215,21 +228,23 @@ class Config:
         
         print(f"\nConnector Types: {len(self.connector_types)}")
         for conn_type, words in self.connector_types.items():
-            print(f"  • {conn_type}: {len(words)} connectors")
+            print(f"  • {conn_type.upper()}: {len(words)} connectors")
         
         print(f"\nSpecial Tokens: {len(self.get_special_tokens())}")
-        print(f"Checkpoint Directory: {self.checkpoint_dir}")
+        print(f"\nTag Format:")
+        print(f"  Opening: {self.opening_tag_format}")
+        print(f"  Closing: {self.closing_tag}")
+        
+        print(f"\nCheckpoint Directory: {self.checkpoint_dir}")
+        print(f"Data Workers: {self.dataloader_num_workers}")
         print("=" * 70 + "\n")
-
 
 
 # ============================================================================
 # MODULE-LEVEL CONSTANTS (FOR BACKWARD COMPATIBILITY)
 # ============================================================================
 
-
 _default_config = Config()
-
 
 # Export constants
 BASE_MODEL = _default_config.model_name
@@ -241,11 +256,9 @@ CHECKPOINT_DIR = _default_config.checkpoint_dir
 SPECIAL_TOKENS = _default_config.get_special_tokens()
 
 
-
 def get_connector_types() -> List[str]:
-    """Get connector type names (uppercase)."""
+    """Get connector type names."""
     return _default_config.get_connector_type_names()
-
 
 
 def verify_configuration():
@@ -260,21 +273,22 @@ def verify_configuration():
     print(f"✓ Model: {config.model_name}")
     print(f"✓ Device: {config.device}")
     print(f"✓ Tag format: {TAG_FORMAT}")
-    print(f"✓ Closing tag: {config.closing_tag}")
     print(f"✓ Boost factor: {config.boost_factor}x")
+    print(f"✓ Discourse attention: {config.use_discourse_attention}")
     print(f"✓ LoRA: {'Enabled' if config.use_lora else 'Disabled'}")
     print(f"✓ Special tokens: {len(SPECIAL_TOKENS)}")
     print(f"✓ Connector types: {len(config.connector_types)}")
     print(f"✓ Checkpoint dir: {CHECKPOINT_DIR}")
+    print(f"✓ Data workers: {config.dataloader_num_workers} (NO MULTIPROCESSING)")
     
     print("\nConnector types:")
     for ctype, words in config.connector_types.items():
         print(f"  - {ctype.upper()}: {len(words)} words")
     
-    print("\nSpecial tokens:")
-    for token in SPECIAL_TOKENS[:3]:  # Show first 3
+    print("\nSpecial tokens (first 5):")
+    for token in SPECIAL_TOKENS[:5]:
         print(f"  • {token}")
-    print(f"  ... and {len(SPECIAL_TOKENS) - 3} more")
+    print(f"  ... and {len(SPECIAL_TOKENS) - 5} more")
     
     # Check CUDA
     try:
@@ -290,7 +304,6 @@ def verify_configuration():
         print("\n⚠️  Could not check CUDA status")
     
     print("\n" + "=" * 70 + "\n")
-
 
 
 if __name__ == "__main__":
