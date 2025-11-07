@@ -1,163 +1,289 @@
 #!/usr/bin/env python3
 """
-main.py - UPDATED
+main.py - BATCH-WISE PARQUET LOADING (MEMORY EFFICIENT)
+Loads and cleans parquet files one at a time, processes in batches
 
-Main entry point for connector-aware pretraining.
-Automatically trains for 1 epoch and saves the model.
+This approach:
+- Loads one parquet file at a time
+- Processes in memory-friendly batches
+- Creates HFDataset incrementally
+- Never loads all data into memory at once
 """
 
 import os
+import gc
 import torch
+import logging
+from pathlib import Path
 from huggingface_hub import login
+from datasets import Dataset as HFDataset, concatenate_datasets
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
 
 # Import project modules
 from utils.config import Config
-from pretrain.model import Model
-from pretrain.data_loader import PretrainingDataLoader, ConnectorDataCollatorWithMaskCreation
+from pretrain.model import initialize_model
 from pretrain.trainer import ConnectorPretrainingManager
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def clear_cuda_memory():
+    """Clear CUDA memory thoroughly."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        logger.info(f"✓ GPU memory cleared")
 
 
 def setup_huggingface():
     """Login to HuggingFace if token available"""
     token = os.environ.get('HF_TOKEN')
     if token:
-        print("Logging into HuggingFace...")
+        logger.info("Logging into HuggingFace...")
         login(token=token)
-        print("✓ Logged in")
+        logger.info("✓ Logged in")
     else:
-        print("⚠ No HF_TOKEN found. Some models may be inaccessible.")
+        logger.warning("⚠ No HF_TOKEN found")
 
 
-def load_model(config: Config):
+def load_model_handler(config: Config):
     """
     Load and prepare model with connector tokens.
     
     Args:
         config: Configuration object
-        
     Returns:
         model_handler: Initialized Model instance
     """
-    print("\n" + "=" * 70)
-    print("LOADING MODEL")
-    print("=" * 70)
+    logger.info("\n" + "="*70)
+    logger.info("LOADING MODEL")
+    logger.info("="*70)
     
-    model_handler = Model(config)
+    clear_cuda_memory()
     
-    # Load tokenizer
-    print("\n[1/4] Loading tokenizer...")
-    tokenizer = model_handler.load_tokenizer()
-    print(f"✓ Original vocab size: {len(tokenizer):,}")
+    model_handler = initialize_model(config)
     
-    # Add special tokens
-    print("\n[2/4] Adding special tokens...")
-    special_tokens = config.get_special_tokens()
-    print(f"Tokens to add: {special_tokens}")
-    num_added = model_handler.extend_tokenizer(special_tokens)
-    print(f"✓ Added {num_added} tokens")
-    print(f"✓ New vocab size: {len(tokenizer):,}")
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        logger.info(f"✓ GPU memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
     
-    # Load model
-    print("\n[3/4] Loading model...")
-    model_handler.load_model()
-    
-    # Initialize embeddings
-    print("\n[4/4] Initializing new embeddings...")
-    initialize_embeddings_with_logging(model_handler, config)
-    
-    # Show model info
-    info = model_handler.get_model_info()
-    print(f"\n✓ Total parameters: {info['total_parameters']:,}")
-    print(f"✓ Trainable parameters: {info['trainable_parameters']:,}")
-    print(f"✓ Device: {info['device']}")
-    print(f"✓ Dtype: {info['dtype']}")
-    if info['connector_boosting']:
-        print(f"✓ Connector boosting: {info['boost_factor']}x")
-    
-    print("\n" + "=" * 70)
-    print("✓ Model loaded successfully")
-    print("=" * 70)
+    logger.info("✓ Model loaded successfully")
+    logger.info("="*70)
     
     return model_handler
 
 
-def initialize_embeddings_with_logging(model_handler, config):
+def clean_dataframe_batch(df):
     """
-    Initialize new token embeddings using semantic averaging.
+    Clean a single batch (from one file or chunk).
+    
+    Fixes:
+    - Converts numpy arrays to lists
+    - Handles null values in list columns
+    - Ensures consistent data types
     
     Args:
-        model_handler: Model instance
-        config: Configuration object
-    """
-    embedding_layer = model_handler.model.get_input_embeddings()
-    current_vocab_size = len(model_handler.tokenizer)
-    fallback_tokens = []
-    
-    with torch.no_grad():
-        existing_embeddings = embedding_layer.weight[:model_handler.original_vocab_size].clone()
-        
-        for token_id in range(model_handler.original_vocab_size, current_vocab_size):
-            token = model_handler.tokenizer.convert_ids_to_tokens(token_id)
-            initialized = False
-            
-            # Try to initialize from similar words
-            for conn_type, example_words in config.connector_types.items():
-                if conn_type.lower() in str(token).lower():
-                    similar_ids = []
-                    
-                    for word in example_words[:5]:  # Use first 5 examples
-                        word_tokens = model_handler.tokenizer.tokenize(word)
-                        if word_tokens:
-                            word_id = model_handler.tokenizer.convert_tokens_to_ids(word_tokens[0])
-                            if word_id < model_handler.original_vocab_size:
-                                similar_ids.append(word_id)
-                    
-                    if similar_ids:
-                        avg_embedding = existing_embeddings[similar_ids].mean(dim=0)
-                        embedding_layer.weight.data[token_id] = avg_embedding
-                        print(f"   ✓ '{token}' initialized from {len(similar_ids)} similar words")
-                        initialized = True
-                        break
-            
-            # Fallback: use mean of all embeddings
-            if not initialized:
-                embedding_layer.weight.data[token_id] = existing_embeddings.mean(dim=0)
-                fallback_tokens.append(token)
-    
-    if fallback_tokens:
-        print(f"   ℹ Fallback embeddings used for {len(fallback_tokens)} tokens")
-
-
-def load_data(config: Config):
-    """
-    Load preprocessed training data.
-    
-    Args:
-        config: Configuration object
+        df: Pandas DataFrame (single file/batch)
         
     Returns:
-        dataset_dict: Dictionary with 'train' and 'test' datasets
+        Cleaned DataFrame
     """
-    print("\n" + "=" * 70)
-    print("LOADING DATA")
-    print("=" * 70)
+    cleaned_df = df.copy()
     
-    data_loader = PretrainingDataLoader(config)
+    # Process each column
+    for col in cleaned_df.columns:
+        if cleaned_df[col].dtype == object:
+            # Check if column contains numpy arrays
+            sample = cleaned_df[col].iloc[0]
+            if isinstance(sample, np.ndarray):
+                cleaned_df[col] = cleaned_df[col].apply(
+                    lambda x: x.tolist() if isinstance(x, np.ndarray) else x
+                )
+            # Handle null values in list columns
+            elif isinstance(sample, list):
+                cleaned_df[col] = cleaned_df[col].apply(
+                    lambda x: x if (isinstance(x, list) and x is not None) else []
+                )
     
-    dataset_dict = data_loader.load_preprocessed_data_for_training(
-        test_split_size=0.05,
-        seed=42
-    )
+    return cleaned_df
+
+
+def df_to_hfdataset_batch(df):
+    """
+    Convert a single batch DataFrame to HFDataset.
     
-    if dataset_dict is None:
-        print("\n❌ Failed to load data!")
-        print("💡 Please run preprocessing first:")
-        print("   python preprocess.py")
+    Args:
+        df: Pandas DataFrame
+        
+    Returns:
+        HFDataset
+    """
+    # Convert to dict format, ensuring all values are Python types (not numpy)
+    data_dict = {}
+    for col in df.columns:
+        data_dict[col] = df[col].tolist()
+    
+    dataset = HFDataset.from_dict(data_dict)
+    return dataset
+
+
+def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.05):
+    """
+    Load data from parquet files BATCH-WISE (memory efficient).
+    
+    Process:
+    1. Find all parquet files
+    2. Load ONE file at a time
+    3. Clean and convert each file to HFDataset
+    4. Concatenate all datasets
+    5. Split into train/validation
+    
+    This approach uses minimal memory (never loads all files at once).
+    
+    Args:
+        parquet_path: Path to parquet directory or file
+        split_ratio: Ratio for train/validation split
+    
+    Returns:
+        dataset_dict: Dictionary with 'train' and 'validation' keys
+    """
+    logger.info("\n" + "="*70)
+    logger.info("LOADING DATA FROM PARQUET (BATCH-WISE)")
+    logger.info("="*70)
+    
+    parquet_path = Path(parquet_path)
+    
+    if not parquet_path.exists():
+        logger.error(f"❌ Path not found: {parquet_path}")
         return None
     
-    print("\n" + "=" * 70)
-    print("✓ Data loaded successfully")
-    print("=" * 70)
+    # Get all parquet files
+    if parquet_path.is_file():
+        parquet_files = [parquet_path]
+    else:
+        parquet_files = sorted(parquet_path.glob("*.parquet"))
+    
+    if not parquet_files:
+        logger.error(f"❌ No parquet files found in {parquet_path}")
+        return None
+    
+    logger.info(f"Found {len(parquet_files)} parquet files")
+    logger.info("Processing files one at a time (batch-wise)...")
+    
+    # Step 1: Validate required columns (check first file only)
+    logger.info("\n[1/3] Validating data structure (checking first file)...")
+    
+    try:
+        first_df = pd.read_parquet(parquet_files[0])
+        
+        required_cols = {'input_ids', 'attention_mask'}
+        actual_cols = set(first_df.columns)
+        
+        if not required_cols.issubset(actual_cols):
+            missing = required_cols - actual_cols
+            logger.error(f"❌ Missing required columns: {missing}")
+            return None
+        
+        logger.info(f"✓ All required columns present")
+        logger.info(f"  Columns: {list(first_df.columns)}")
+        logger.info(f"  First file has {len(first_df):,} rows")
+        
+    except Exception as e:
+        logger.error(f"❌ Error validating first file: {e}")
+        return None
+    
+    # Step 2: Process files one by one
+    logger.info("\n[2/3] Processing parquet files batch-wise...")
+    
+    all_datasets = []
+    total_rows = 0
+    
+    for file_idx, file_path in enumerate(tqdm(parquet_files, desc="Processing files"), 1):
+        try:
+            # Load file
+            df = pd.read_parquet(file_path)
+            num_rows = len(df)
+            total_rows += num_rows
+            
+            logger.debug(f"  File {file_idx}: {num_rows:,} rows")
+            
+            # Clean file (batch-wise)
+            df = clean_dataframe_batch(df)
+            
+            # Convert to HFDataset
+            dataset = df_to_hfdataset_batch(df)
+            
+            # Store dataset
+            all_datasets.append(dataset)
+            
+            # Memory cleanup after each file
+            del df
+            gc.collect()
+            
+        except Exception as e:
+            logger.error(f"  ❌ Error processing {file_path.name}: {e}")
+            continue
+    
+    if not all_datasets:
+        logger.error("❌ No datasets created from parquet files")
+        return None
+    
+    logger.info(f"✓ Processed {len(all_datasets)} files ({total_rows:,} total rows)")
+    
+    # Step 3: Concatenate all datasets
+    logger.info("\n[3/3] Concatenating datasets...")
+    
+    try:
+        if len(all_datasets) == 1:
+            full_dataset = all_datasets[0]
+            logger.info(f"✓ Single dataset: {len(full_dataset):,} samples")
+        else:
+            logger.info(f"Concatenating {len(all_datasets)} datasets...")
+            full_dataset = concatenate_datasets(all_datasets)
+            logger.info(f"✓ Concatenated: {len(full_dataset):,} samples")
+        
+        # Verify structure
+        sample = full_dataset[0]
+        logger.info(f"\n✓ Dataset structure verified:")
+        logger.info(f"  - Has 'input_ids': {'input_ids' in sample}")
+        logger.info(f"  - Has 'attention_mask': {'attention_mask' in sample}")
+        logger.info(f"  - Has 'connector_mask': {'connector_mask' in sample}")
+        
+    except Exception as e:
+        logger.error(f"❌ Error concatenating datasets: {e}")
+        return None
+    
+    # Split into train/validation
+    logger.info(f"\n✓ Splitting into train/validation...")
+    
+    if split_ratio > 0 and split_ratio < 1:
+        split = full_dataset.train_test_split(test_size=split_ratio, seed=42)
+        dataset_dict = {
+            'train': split['train'],
+            'validation': split['test']
+        }
+        logger.info(f"✓ Split complete:")
+        logger.info(f"  - Train: {len(dataset_dict['train']):,} samples")
+        logger.info(f"  - Validation: {len(dataset_dict['validation']):,} samples")
+    else:
+        dataset_dict = {
+            'train': full_dataset,
+            'validation': None
+        }
+        logger.info(f"✓ Using full dataset: {len(full_dataset):,} samples")
+    
+    logger.info("\n" + "="*70)
+    logger.info("✓ Data loaded successfully (batch-wise)")
+    logger.info("="*70)
     
     return dataset_dict
 
@@ -169,51 +295,67 @@ def run_training(config, model_handler, dataset_dict):
     Args:
         config: Configuration object
         model_handler: Model instance
-        dataset_dict: Dictionary with 'train' and 'test' datasets
+        dataset_dict: Dictionary with 'train' and 'validation' datasets
     """
-    print("\n" + "=" * 70)
-    print("SETTING UP TRAINING")
-    print("=" * 70)
+    logger.info("\n" + "="*70)
+    logger.info("SETTING UP TRAINING")
+    logger.info("="*70)
+    
+    clear_cuda_memory()
     
     # Create training manager
-    print("\n[1/3] Creating training manager...")
+    logger.info("\n[1/3] Creating training manager...")
+    
     pretrain_manager = ConnectorPretrainingManager(
         config=config,
         model_handler=model_handler,
-        use_new_collator=True  # Use new collator from data_loader.py
+        use_new_collator=True
     )
-    print("✓ Training manager created")
+    
+    logger.info("✓ Training manager created")
     
     # Prepare trainer
-    print("\n[2/3] Preparing trainer...")
+    logger.info("\n[2/3] Preparing trainer...")
+    
     pretrain_manager.prepare_trainer(
         train_dataset=dataset_dict['train'],
-        eval_dataset=dataset_dict['test'],
+        eval_dataset=dataset_dict.get('validation'),
         output_dir="./output/connector_model_1epoch",
         
         # Connector boosting settings
-        boost_factor=1.1,              # 10% boost for connectors
-        use_amplification=True,         # Additional amplification
-        amplification_strength=1.2,     # 20% additional boost
+        boost_factor=config.boost_factor,
+        use_amplification=False,
+        amplification_strength=1.0,
         
-        # Training settings (1 EPOCH)
-        num_epochs=1,                   # Train for 1 epoch only
-        batch_size=2,
+        # Training settings
+        num_epochs=1,
+        batch_size=1,
         learning_rate=5e-6
     )
-    print("✓ Trainer prepared")
+    
+    logger.info("✓ Trainer prepared")
+    
+    # Show memory before training
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"\n✓ GPU memory before training:")
+        logger.info(f"  - Allocated: {allocated:.2f} GB")
+        logger.info(f"  - Reserved: {reserved:.2f} GB")
+        logger.info(f"  - Available: {total - reserved:.2f} GB")
     
     # Start training
-    print("\n[3/3] Starting training (1 epoch)...")
-    print("\n" + "=" * 70)
-    print("TRAINING IN PROGRESS")
-    print("=" * 70)
+    logger.info("\n[3/3] Starting training...")
+    logger.info("\n" + "="*70)
+    logger.info("TRAINING IN PROGRESS")
+    logger.info("="*70 + "\n")
     
     pretrain_manager.train()
     
-    print("\n" + "=" * 70)
-    print("✓ Training complete!")
-    print("=" * 70)
+    logger.info("\n" + "="*70)
+    logger.info("✓ TRAINING COMPLETE")
+    logger.info("="*70)
     
     return pretrain_manager
 
@@ -225,87 +367,109 @@ def save_model(pretrain_manager):
     Args:
         pretrain_manager: Training manager instance
     """
-    print("\n" + "=" * 70)
-    print("SAVING MODEL")
-    print("=" * 70)
+    logger.info("\n" + "="*70)
+    logger.info("SAVING MODEL")
+    logger.info("="*70)
     
     output_path = "./output/connector_model_1epoch/final"
     pretrain_manager.save_model(output_path)
     
-    print("\n✓ Model saved to:", output_path)
-    print("=" * 70)
+    logger.info(f"✓ Model saved to: {output_path}")
+    logger.info("="*70)
 
 
 def main():
-    """Main entry point - Runs full training pipeline"""
-    print("\n" + "=" * 70)
-    print("CONNECTOR-AWARE PRETRAINING PIPELINE")
-    print("Training for 1 epoch with automatic save")
-    print("=" * 70)
+    """
+    Main entry point - Runs full training pipeline with batch-wise parquet loading.
+    """
+    
+    logger.info("\n" + "="*70)
+    logger.info("CONNECTOR-AWARE PRETRAINING PIPELINE")
+    logger.info("BATCH-WISE PARQUET LOADING (MEMORY EFFICIENT)")
+    logger.info("Training for 1 epoch")
+    logger.info("="*70)
     
     try:
-        # Step 1: Setup HuggingFace
+        # Initial memory check
+        if torch.cuda.is_available():
+            logger.info(f"\n✓ GPU: {torch.cuda.get_device_name(0)}")
+            total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+            logger.info(f"✓ Total GPU memory: {total_mem:.2f} GB")
+        else:
+            logger.warning("⚠ No GPU detected")
+        
+        # Setup HuggingFace
         setup_huggingface()
         
-        # Step 2: Load configuration
-        print("\n[Step 1/5] Loading configuration...")
+        # Load configuration
+        logger.info("\n[Step 1/5] Loading configuration...")
         config = Config()
-        print(f"✓ Model: {config.model_name}")
-        print(f"✓ Connector types: {len(config.connector_types)}")
-        print(f"✓ Boost factor: {config.boost_factor}x")
+        config.print_summary()
         
-        # Step 3: Load model
-        print("\n[Step 2/5] Loading model...")
-        model_handler = load_model(config)
+        # Load model
+        logger.info("\n[Step 2/5] Loading model...")
+        model_handler = load_model_handler(config)
         
-        # Step 4: Load data
-        print("\n[Step 3/5] Loading data...")
-        dataset_dict = load_data(config)
+        # Load data from parquet (batch-wise)
+        logger.info("\n[Step 3/5] Loading data from parquet (batch-wise)...")
         
-        if dataset_dict is None:
-            print("\n❌ Pipeline failed: No data loaded")
-            print("\n💡 To continue:")
-            print("   1. Run preprocessing: python preprocess.py")
-            print("   2. Then run this script again: python main.py")
+        parquet_path = os.environ.get('PARQUET_PATH', './data_splits')
+        logger.info(f"Parquet path: {parquet_path}")
+        
+        dataset_dict = load_data_from_parquet_batch_wise(parquet_path, split_ratio=0.05)
+        
+        if dataset_dict is None or dataset_dict['train'] is None:
+            logger.error("\n❌ Failed to load data")
+            logger.info("\n💡 Make sure:")
+            logger.info("  • Parquet files exist at: ./data_splits")
+            logger.info("  • Or set: export PARQUET_PATH=/path/to/parquet")
+            logger.info("  • Parquet columns include: input_ids, attention_mask")
             return
         
-        # Step 5: Train model
-        print("\n[Step 4/5] Training model (1 epoch)...")
+        # Train model
+        logger.info("\n[Step 4/5] Training model...")
         pretrain_manager = run_training(config, model_handler, dataset_dict)
         
-        # Step 6: Save model
-        print("\n[Step 5/5] Saving model...")
+        # Save model
+        logger.info("\n[Step 5/5] Saving model...")
         save_model(pretrain_manager)
         
-        # Success!
-        print("\n" + "=" * 70)
-        print("✅ PIPELINE COMPLETE!")
-        print("=" * 70)
-        print("\n📊 Training Summary:")
-        print(f"   • Model: {config.model_name}")
-        print(f"   • Training samples: {len(dataset_dict['train']):,}")
-        print(f"   • Eval samples: {len(dataset_dict['test']):,}")
-        print(f"   • Epochs: 1")
-        print(f"   • Boost factor: {config.boost_factor}x")
-        print(f"   • Output: ./output/connector_model_1epoch/final")
-        print("\n🎉 Model trained and saved successfully!")
-        print("\n💡 Next steps:")
-        print("   • Load model: AutoModelForCausalLM.from_pretrained('./output/connector_model_1epoch/final')")
-        print("   • Continue training: Increase num_epochs in run_training()")
-        print("   • Evaluate: Run evaluation script on saved model")
+        # Cleanup
+        clear_cuda_memory()
+        
+        # Success message
+        logger.info("\n" + "="*70)
+        logger.info("✅ PIPELINE COMPLETE!")
+        logger.info("="*70)
+        logger.info("\n📊 Summary:")
+        logger.info(f"  • Model: {config.model_name}")
+        logger.info(f"  • Training samples: {len(dataset_dict['train']):,}")
+        if dataset_dict.get('validation'):
+            logger.info(f"  • Validation samples: {len(dataset_dict['validation']):,}")
+        logger.info(f"  • Epochs: 1")
+        logger.info(f"  • Batch size: 1")
+        logger.info(f"  • Loading mode: Batch-wise (memory efficient)")
+        logger.info(f"  • Output: ./output/connector_model_1epoch/final")
+        logger.info("\n🎉 Done!")
+        
+    except torch.cuda.OutOfMemoryError:
+        logger.error("\n❌ CUDA Out of Memory!")
+        logger.info("\nThis shouldn't happen with batch-wise loading.")
+        logger.info("Try:")
+        logger.info("  • Reduce batch size (already at 1)")
+        logger.info("  • Use fewer parquet files")
+        logger.info("  • Restart system to clear memory")
+        clear_cuda_memory()
         
     except KeyboardInterrupt:
-        print("\n\n⚠️  Training interrupted by user (Ctrl+C)")
-        print("💡 Progress may be saved in checkpoints")
+        logger.warning("\n⚠ Training interrupted by user")
+        clear_cuda_memory()
         
     except Exception as e:
-        print(f"\n\n❌ Error occurred: {e}")
+        logger.error(f"\n❌ Error: {e}")
         import traceback
         traceback.print_exc()
-        print("\n💡 Check error above and ensure:")
-        print("   • Preprocessing is complete")
-        print("   • Model is accessible (check HF_TOKEN)")
-        print("   • Sufficient GPU memory available")
+        clear_cuda_memory()
 
 
 if __name__ == "__main__":

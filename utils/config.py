@@ -6,12 +6,9 @@ Configuration for connector-aware pretraining on Llama 3.2 3B.
 Uses the actual Llama tokenizer (meta-llama/Llama-3.2-3B-Instruct).
 """
 
-
 import os
 from typing import List, Dict, Optional
-from dataclasses import dataclass, field
-
-
+from dataclasses import dataclass, field, asdict
 
 @dataclass
 class Config:
@@ -172,6 +169,10 @@ class Config:
         
         return True
     
+    def to_dict(self) -> dict:
+        """Convert Config to dictionary for model compatibility."""
+        return asdict(self)
+
     def print_summary(self):
         """Print configuration summary."""
         print("\n" + "=" * 70)
