@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-main.py - BATCH-WISE PARQUET LOADING (MEMORY EFFICIENT)
-Loads and cleans parquet files one at a time, processes in batches
+main.py - WITH data_loader.py COMPATIBILITY
+Converts HFDataset to return torch tensors so data_loader.py collator works
 
-This approach:
-- Loads one parquet file at a time
-- Processes in memory-friendly batches
-- Creates HFDataset incrementally
-- Never loads all data into memory at once
+Key fix: TensorDatasetWrapper converts list columns to torch.Tensor
+This way data_loader.py's ConnectorDataCollatorWithMaskCreation can process them
 """
 
 import os
@@ -25,6 +22,7 @@ from tqdm import tqdm
 from utils.config import Config
 from pretrain.model import initialize_model
 from pretrain.trainer import ConnectorPretrainingManager
+from pretrain.data_loader import ConnectorDataCollatorWithMaskCreation
 
 # Setup logging
 logging.basicConfig(
@@ -136,28 +134,84 @@ def df_to_hfdataset_batch(df):
     return dataset
 
 
+class TensorDatasetWrapper:
+    """
+    Wrapper that converts HFDataset items to torch tensors.
+    
+    CRITICAL: data_loader.py's CollectorDataCollatorWithMaskCreation expects
+    batch items to have torch.Tensor values, not Python lists.
+    
+    This wrapper ensures:
+    - input_ids → torch.Tensor (torch.long)
+    - attention_mask → torch.Tensor (torch.long)
+    - connector_mask → torch.Tensor (torch.float) if present
+    """
+    
+    def __init__(self, dataset: HFDataset):
+        self.dataset = dataset
+        self.length = len(dataset)
+    
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        
+        # Convert input_ids to tensor
+        input_ids = item.get("input_ids")
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        else:
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        
+        # Convert attention_mask to tensor
+        attention_mask = item.get("attention_mask")
+        if isinstance(attention_mask, list):
+            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        else:
+            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        
+        # Convert connector_mask to tensor if present
+        connector_mask = item.get("connector_mask")
+        if connector_mask is not None:
+            if isinstance(connector_mask, list):
+                connector_mask = torch.tensor(connector_mask, dtype=torch.float)
+            else:
+                connector_mask = torch.tensor(connector_mask, dtype=torch.float)
+        
+        # Return dict with tensor values
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "connector_mask": connector_mask if connector_mask is not None else torch.ones_like(input_ids, dtype=torch.float),
+            "connector_words": item.get("connector_words", []),
+            "connector_types": item.get("connector_types", [])
+        }
+
+
 def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.05):
     """
     Load data from parquet files BATCH-WISE (memory efficient).
+    Wraps with TensorDatasetWrapper for data_loader.py compatibility.
     
     Process:
     1. Find all parquet files
     2. Load ONE file at a time
     3. Clean and convert each file to HFDataset
     4. Concatenate all datasets
-    5. Split into train/validation
-    
-    This approach uses minimal memory (never loads all files at once).
+    5. WRAP with TensorDatasetWrapper
+    6. Split into train/validation
     
     Args:
         parquet_path: Path to parquet directory or file
         split_ratio: Ratio for train/validation split
     
     Returns:
-        dataset_dict: Dictionary with 'train' and 'validation' keys
+        dataset_dict: Dictionary with 'train' and 'validation' keys (wrapped)
     """
     logger.info("\n" + "="*70)
     logger.info("LOADING DATA FROM PARQUET (BATCH-WISE)")
+    logger.info("With TensorDatasetWrapper for data_loader.py compatibility")
     logger.info("="*70)
     
     parquet_path = Path(parquet_path)
@@ -240,7 +294,7 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
     logger.info(f"✓ Processed {len(all_datasets)} files ({total_rows:,} total rows)")
     
     # Step 3: Concatenate all datasets
-    logger.info("\n[3/3] Concatenating datasets...")
+    logger.info("\n[3/3] Concatenating and wrapping datasets...")
     
     try:
         if len(all_datasets) == 1:
@@ -262,27 +316,31 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
         logger.error(f"❌ Error concatenating datasets: {e}")
         return None
     
-    # Split into train/validation
+    # Split into train/validation BEFORE wrapping
     logger.info(f"\n✓ Splitting into train/validation...")
     
     if split_ratio > 0 and split_ratio < 1:
         split = full_dataset.train_test_split(test_size=split_ratio, seed=42)
-        dataset_dict = {
-            'train': split['train'],
-            'validation': split['test']
-        }
-        logger.info(f"✓ Split complete:")
-        logger.info(f"  - Train: {len(dataset_dict['train']):,} samples")
-        logger.info(f"  - Validation: {len(dataset_dict['validation']):,} samples")
+        train_dataset = split['train']
+        val_dataset = split['test']
+        logger.info(f"  - Train: {len(train_dataset):,} samples")
+        logger.info(f"  - Validation: {len(val_dataset):,} samples")
     else:
-        dataset_dict = {
-            'train': full_dataset,
-            'validation': None
-        }
-        logger.info(f"✓ Using full dataset: {len(full_dataset):,} samples")
+        train_dataset = full_dataset
+        val_dataset = None
+        logger.info(f"  - Using full dataset: {len(train_dataset):,} samples")
+    
+    # NOW wrap with TensorDatasetWrapper
+    logger.info("\n✓ Wrapping datasets with TensorDatasetWrapper...")
+    logger.info("  (Converting lists to torch.Tensor for data_loader.py)")
+    
+    dataset_dict = {
+        'train': TensorDatasetWrapper(train_dataset),
+        'validation': TensorDatasetWrapper(val_dataset) if val_dataset else None
+    }
     
     logger.info("\n" + "="*70)
-    logger.info("✓ Data loaded successfully (batch-wise)")
+    logger.info("✓ Data loaded and wrapped successfully")
     logger.info("="*70)
     
     return dataset_dict
@@ -291,11 +349,12 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
 def run_training(config, model_handler, dataset_dict):
     """
     Run training for 1 epoch and save the model.
+    Uses data_loader.py's ConnectorDataCollatorWithMaskCreation
     
     Args:
         config: Configuration object
         model_handler: Model instance
-        dataset_dict: Dictionary with 'train' and 'validation' datasets
+        dataset_dict: Dictionary with wrapped 'train' and 'validation' datasets
     """
     logger.info("\n" + "="*70)
     logger.info("SETTING UP TRAINING")
@@ -309,13 +368,13 @@ def run_training(config, model_handler, dataset_dict):
     pretrain_manager = ConnectorPretrainingManager(
         config=config,
         model_handler=model_handler,
-        use_new_collator=True
+        use_new_collator=True  # Uses data_loader.py collator
     )
     
     logger.info("✓ Training manager created")
     
-    # Prepare trainer
-    logger.info("\n[2/3] Preparing trainer...")
+    # Prepare trainer with data_loader.py collator
+    logger.info("\n[2/3] Preparing trainer with data_loader.py collator...")
     
     pretrain_manager.prepare_trainer(
         train_dataset=dataset_dict['train'],
@@ -333,7 +392,7 @@ def run_training(config, model_handler, dataset_dict):
         learning_rate=5e-6
     )
     
-    logger.info("✓ Trainer prepared")
+    logger.info("✓ Trainer prepared with data_loader.py")
     
     # Show memory before training
     if torch.cuda.is_available():
@@ -380,12 +439,12 @@ def save_model(pretrain_manager):
 
 def main():
     """
-    Main entry point - Runs full training pipeline with batch-wise parquet loading.
+    Main entry point - Runs full training pipeline with data_loader.py integration.
     """
     
     logger.info("\n" + "="*70)
     logger.info("CONNECTOR-AWARE PRETRAINING PIPELINE")
-    logger.info("BATCH-WISE PARQUET LOADING (MEMORY EFFICIENT)")
+    logger.info("BATCH-WISE PARQUET LOADING WITH data_loader.py")
     logger.info("Training for 1 epoch")
     logger.info("="*70)
     
@@ -410,8 +469,8 @@ def main():
         logger.info("\n[Step 2/5] Loading model...")
         model_handler = load_model_handler(config)
         
-        # Load data from parquet (batch-wise)
-        logger.info("\n[Step 3/5] Loading data from parquet (batch-wise)...")
+        # Load data from parquet (batch-wise with wrapping)
+        logger.info("\n[Step 3/5] Loading data from parquet...")
         
         parquet_path = os.environ.get('PARQUET_PATH', './data_splits')
         logger.info(f"Parquet path: {parquet_path}")
@@ -449,13 +508,13 @@ def main():
         logger.info(f"  • Epochs: 1")
         logger.info(f"  • Batch size: 1")
         logger.info(f"  • Loading mode: Batch-wise (memory efficient)")
+        logger.info(f"  • Data collator: data_loader.py (ConnectorDataCollatorWithMaskCreation)")
         logger.info(f"  • Output: ./output/connector_model_1epoch/final")
         logger.info("\n🎉 Done!")
         
     except torch.cuda.OutOfMemoryError:
         logger.error("\n❌ CUDA Out of Memory!")
-        logger.info("\nThis shouldn't happen with batch-wise loading.")
-        logger.info("Try:")
+        logger.info("\nTry:")
         logger.info("  • Reduce batch size (already at 1)")
         logger.info("  • Use fewer parquet files")
         logger.info("  • Restart system to clear memory")
