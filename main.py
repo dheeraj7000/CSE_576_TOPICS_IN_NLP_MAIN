@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-main.py - WITH data_loader.py COMPATIBILITY
-Converts HFDataset to return torch tensors so data_loader.py collator works
+main.py - UPDATED FOR model_multiword_support.py
 
-Key fix: TensorDatasetWrapper converts list columns to torch.Tensor
-This way data_loader.py's ConnectorDataCollatorWithMaskCreation can process them
+CRITICAL SIMPLIFICATION:
+- Model auto-detects connector tags from input_ids
+- NO TensorDatasetWrapper needed!
+- Simpler data pipeline
+- Works with or without connector_mask in parquet
+
+FLOW:
+parquet → input_ids + attention_mask → model detects tags → boost applied
 """
 
 import os
@@ -22,7 +27,6 @@ from tqdm import tqdm
 from utils.config import Config
 from pretrain.model import initialize_model
 from pretrain.trainer import ConnectorPretrainingManager
-from pretrain.data_loader import ConnectorDataCollatorWithMaskCreation
 
 # Setup logging
 logging.basicConfig(
@@ -82,15 +86,12 @@ def load_model_handler(config: Config):
 
 def clean_dataframe_batch(df):
     """
-    Clean a single batch (from one file or chunk).
+    Clean a single batch DataFrame.
     
-    Fixes:
-    - Converts numpy arrays to lists
-    - Handles null values in list columns
-    - Ensures consistent data types
+    Converts numpy arrays to lists for HFDataset compatibility.
     
     Args:
-        df: Pandas DataFrame (single file/batch)
+        df: Pandas DataFrame
         
     Returns:
         Cleaned DataFrame
@@ -101,7 +102,7 @@ def clean_dataframe_batch(df):
     for col in cleaned_df.columns:
         if cleaned_df[col].dtype == object:
             # Check if column contains numpy arrays
-            sample = cleaned_df[col].iloc[0]
+            sample = cleaned_df[col].iloc[0] if len(cleaned_df) > 0 else None
             if isinstance(sample, np.ndarray):
                 cleaned_df[col] = cleaned_df[col].apply(
                     lambda x: x.tolist() if isinstance(x, np.ndarray) else x
@@ -117,7 +118,7 @@ def clean_dataframe_batch(df):
 
 def df_to_hfdataset_batch(df):
     """
-    Convert a single batch DataFrame to HFDataset.
+    Convert DataFrame to HFDataset.
     
     Args:
         df: Pandas DataFrame
@@ -125,7 +126,7 @@ def df_to_hfdataset_batch(df):
     Returns:
         HFDataset
     """
-    # Convert to dict format, ensuring all values are Python types (not numpy)
+    # Convert to dict format
     data_dict = {}
     for col in df.columns:
         data_dict[col] = df[col].tolist()
@@ -134,84 +135,23 @@ def df_to_hfdataset_batch(df):
     return dataset
 
 
-class TensorDatasetWrapper:
-    """
-    Wrapper that converts HFDataset items to torch tensors.
-    
-    CRITICAL: data_loader.py's CollectorDataCollatorWithMaskCreation expects
-    batch items to have torch.Tensor values, not Python lists.
-    
-    This wrapper ensures:
-    - input_ids → torch.Tensor (torch.long)
-    - attention_mask → torch.Tensor (torch.long)
-    - connector_mask → torch.Tensor (torch.float) if present
-    """
-    
-    def __init__(self, dataset: HFDataset):
-        self.dataset = dataset
-        self.length = len(dataset)
-    
-    def __len__(self):
-        return self.length
-    
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        
-        # Convert input_ids to tensor
-        input_ids = item.get("input_ids")
-        if isinstance(input_ids, list):
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-        else:
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-        
-        # Convert attention_mask to tensor
-        attention_mask = item.get("attention_mask")
-        if isinstance(attention_mask, list):
-            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-        else:
-            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-        
-        # Convert connector_mask to tensor if present
-        connector_mask = item.get("connector_mask")
-        if connector_mask is not None:
-            if isinstance(connector_mask, list):
-                connector_mask = torch.tensor(connector_mask, dtype=torch.float)
-            else:
-                connector_mask = torch.tensor(connector_mask, dtype=torch.float)
-        
-        # Return dict with tensor values
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "connector_mask": connector_mask if connector_mask is not None else torch.ones_like(input_ids, dtype=torch.float),
-            "connector_words": item.get("connector_words", []),
-            "connector_types": item.get("connector_types", [])
-        }
-
-
 def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.05):
     """
     Load data from parquet files BATCH-WISE (memory efficient).
-    Wraps with TensorDatasetWrapper for data_loader.py compatibility.
     
-    Process:
-    1. Find all parquet files
-    2. Load ONE file at a time
-    3. Clean and convert each file to HFDataset
-    4. Concatenate all datasets
-    5. WRAP with TensorDatasetWrapper
-    6. Split into train/validation
+    SIMPLIFIED: No TensorDatasetWrapper needed!
+    Model auto-detects connector tags from input_ids.
     
     Args:
         parquet_path: Path to parquet directory or file
         split_ratio: Ratio for train/validation split
     
     Returns:
-        dataset_dict: Dictionary with 'train' and 'validation' keys (wrapped)
+        dataset_dict: Dictionary with 'train' and 'validation' HFDatasets
     """
     logger.info("\n" + "="*70)
     logger.info("LOADING DATA FROM PARQUET (BATCH-WISE)")
-    logger.info("With TensorDatasetWrapper for data_loader.py compatibility")
+    logger.info("SIMPLIFIED: Model auto-detects connector tags")
     logger.info("="*70)
     
     parquet_path = Path(parquet_path)
@@ -231,10 +171,9 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
         return None
     
     logger.info(f"Found {len(parquet_files)} parquet files")
-    logger.info("Processing files one at a time (batch-wise)...")
     
-    # Step 1: Validate required columns (check first file only)
-    logger.info("\n[1/3] Validating data structure (checking first file)...")
+    # Step 1: Validate required columns
+    logger.info("\n[1/3] Validating data structure...")
     
     try:
         first_df = pd.read_parquet(parquet_files[0])
@@ -245,11 +184,20 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
         if not required_cols.issubset(actual_cols):
             missing = required_cols - actual_cols
             logger.error(f"❌ Missing required columns: {missing}")
+            logger.error(f"   Available: {actual_cols}")
             return None
         
-        logger.info(f"✓ All required columns present")
-        logger.info(f"  Columns: {list(first_df.columns)}")
+        logger.info(f"✓ Required columns present")
+        logger.info(f"  Columns in parquet: {list(actual_cols)}")
         logger.info(f"  First file has {len(first_df):,} rows")
+        
+        # Check if connector_mask is present
+        has_connector_mask = 'connector_mask' in actual_cols
+        logger.info(f"  connector_mask present: {has_connector_mask}")
+        if has_connector_mask:
+            logger.info(f"    (Will be used for loss weighting)")
+        else:
+            logger.info(f"    (Model will auto-detect tags from input_ids)")
         
     except Exception as e:
         logger.error(f"❌ Error validating first file: {e}")
@@ -270,7 +218,7 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
             
             logger.debug(f"  File {file_idx}: {num_rows:,} rows")
             
-            # Clean file (batch-wise)
+            # Clean file
             df = clean_dataframe_batch(df)
             
             # Convert to HFDataset
@@ -279,7 +227,7 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
             # Store dataset
             all_datasets.append(dataset)
             
-            # Memory cleanup after each file
+            # Memory cleanup
             del df
             gc.collect()
             
@@ -294,7 +242,7 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
     logger.info(f"✓ Processed {len(all_datasets)} files ({total_rows:,} total rows)")
     
     # Step 3: Concatenate all datasets
-    logger.info("\n[3/3] Concatenating and wrapping datasets...")
+    logger.info("\n[3/3] Concatenating datasets...")
     
     try:
         if len(all_datasets) == 1:
@@ -316,31 +264,26 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
         logger.error(f"❌ Error concatenating datasets: {e}")
         return None
     
-    # Split into train/validation BEFORE wrapping
+    # Split into train/validation
     logger.info(f"\n✓ Splitting into train/validation...")
     
     if split_ratio > 0 and split_ratio < 1:
         split = full_dataset.train_test_split(test_size=split_ratio, seed=42)
-        train_dataset = split['train']
-        val_dataset = split['test']
-        logger.info(f"  - Train: {len(train_dataset):,} samples")
-        logger.info(f"  - Validation: {len(val_dataset):,} samples")
+        dataset_dict = {
+            'train': split['train'],
+            'validation': split['test']
+        }
+        logger.info(f"  - Train: {len(dataset_dict['train']):,} samples")
+        logger.info(f"  - Validation: {len(dataset_dict['validation']):,} samples")
     else:
-        train_dataset = full_dataset
-        val_dataset = None
-        logger.info(f"  - Using full dataset: {len(train_dataset):,} samples")
-    
-    # NOW wrap with TensorDatasetWrapper
-    logger.info("\n✓ Wrapping datasets with TensorDatasetWrapper...")
-    logger.info("  (Converting lists to torch.Tensor for data_loader.py)")
-    
-    dataset_dict = {
-        'train': TensorDatasetWrapper(train_dataset),
-        'validation': TensorDatasetWrapper(val_dataset) if val_dataset else None
-    }
+        dataset_dict = {
+            'train': full_dataset,
+            'validation': None
+        }
+        logger.info(f"  - Using full dataset: {len(full_dataset):,} samples")
     
     logger.info("\n" + "="*70)
-    logger.info("✓ Data loaded and wrapped successfully")
+    logger.info("✓ Data loaded successfully (NO WRAPPING NEEDED)")
     logger.info("="*70)
     
     return dataset_dict
@@ -349,12 +292,11 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
 def run_training(config, model_handler, dataset_dict):
     """
     Run training for 1 epoch and save the model.
-    Uses data_loader.py's ConnectorDataCollatorWithMaskCreation
     
     Args:
         config: Configuration object
         model_handler: Model instance
-        dataset_dict: Dictionary with wrapped 'train' and 'validation' datasets
+        dataset_dict: Dictionary with 'train' and 'validation' datasets
     """
     logger.info("\n" + "="*70)
     logger.info("SETTING UP TRAINING")
@@ -373,8 +315,8 @@ def run_training(config, model_handler, dataset_dict):
     
     logger.info("✓ Training manager created")
     
-    # Prepare trainer with data_loader.py collator
-    logger.info("\n[2/3] Preparing trainer with data_loader.py collator...")
+    # Prepare trainer
+    logger.info("\n[2/3] Preparing trainer...")
     
     pretrain_manager.prepare_trainer(
         train_dataset=dataset_dict['train'],
@@ -392,7 +334,7 @@ def run_training(config, model_handler, dataset_dict):
         learning_rate=5e-6
     )
     
-    logger.info("✓ Trainer prepared with data_loader.py")
+    logger.info("✓ Trainer prepared")
     
     # Show memory before training
     if torch.cuda.is_available():
@@ -439,12 +381,17 @@ def save_model(pretrain_manager):
 
 def main():
     """
-    Main entry point - Runs full training pipeline with data_loader.py integration.
+    Main entry point - Simplified training pipeline.
+    
+    UPDATED FOR model_multiword_support.py:
+    - Model auto-detects connector tags
+    - No TensorDatasetWrapper needed
+    - Simpler, cleaner code
     """
     
     logger.info("\n" + "="*70)
     logger.info("CONNECTOR-AWARE PRETRAINING PIPELINE")
-    logger.info("BATCH-WISE PARQUET LOADING WITH data_loader.py")
+    logger.info("UPDATED: Model auto-detects connector tags")
     logger.info("Training for 1 epoch")
     logger.info("="*70)
     
@@ -469,7 +416,7 @@ def main():
         logger.info("\n[Step 2/5] Loading model...")
         model_handler = load_model_handler(config)
         
-        # Load data from parquet (batch-wise with wrapping)
+        # Load data from parquet
         logger.info("\n[Step 3/5] Loading data from parquet...")
         
         parquet_path = os.environ.get('PARQUET_PATH', './data_splits')
@@ -482,7 +429,8 @@ def main():
             logger.info("\n💡 Make sure:")
             logger.info("  • Parquet files exist at: ./data_splits")
             logger.info("  • Or set: export PARQUET_PATH=/path/to/parquet")
-            logger.info("  • Parquet columns include: input_ids, attention_mask")
+            logger.info("  • Parquet has columns: input_ids, attention_mask")
+            logger.info("  • connector_mask is optional (model auto-detects)")
             return
         
         # Train model
@@ -507,9 +455,13 @@ def main():
             logger.info(f"  • Validation samples: {len(dataset_dict['validation']):,}")
         logger.info(f"  • Epochs: 1")
         logger.info(f"  • Batch size: 1")
-        logger.info(f"  • Loading mode: Batch-wise (memory efficient)")
-        logger.info(f"  • Data collator: data_loader.py (ConnectorDataCollatorWithMaskCreation)")
-        logger.info(f"  • Output: ./output/connector_model_1epoch/final")
+        logger.info(f"\n✓ Key Features:")
+        logger.info(f"  • Auto connector tag detection")
+        logger.info(f"  • Multi-word connector support")
+        logger.info(f"  • Boost applied at embedding layer")
+        logger.info(f"  • Gradient amplification: 1.1× (not 1.1^28)")
+        logger.info(f"  • No TensorDatasetWrapper needed")
+        logger.info(f"\n  • Output: ./output/connector_model_1epoch/final")
         logger.info("\n🎉 Done!")
         
     except torch.cuda.OutOfMemoryError:
