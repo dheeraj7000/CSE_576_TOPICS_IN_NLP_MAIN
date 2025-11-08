@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-model.py - COMPLETE INTEGRATED VERSION (WITH CONFIG.PY)
+model_validated_final.py - UPDATED TO HANDLE MULTI-WORD CONNECTORS
 
-Llama 3.2 with connector-aware hidden state boosting.
-Includes model architecture + handler for loading, saving, checkpointing.
+CRITICAL UPDATE:
+1. Detects opening and closing connector tags
+2. Identifies ALL tokens between opening and closing tags
+3. Boosts ALL enclosed tokens (handles "in general", "in conclusion", etc.)
+4. Works with single-word AND multi-word connector phrases
+5. Applies boost ONCE at input (no per-layer compounding)
 
-USES: config.py for all configuration (model name, device, boost_factor, etc.)
+EXAMPLES:
+✓ <connector type="CAUSAL">because</connector>
+✓ <connector type="CONCLUSIVE">in conclusion</connector>  (multi-word)
+✓ <connector type="ADDITIVE">for example</connector>  (multi-word)
 
-ARCHITECTURAL CHANGES:
-1. Connector boosting applied ONCE per TransformerBlock (at the end)
-2. NO compounding (1.1 only, not 1.1²)
-3. Amplifies gradients for connector positions
-4. Improves weight updates for logical connectors
-5. Enables better reasoning learning during pretraining
-
-Reference: https://sebastianraschka.com/llms-from-scratch/ch05/07_gpt_to_llama/
+All enclosed tokens get 1.1× boost!
 """
 
 import torch
@@ -22,7 +22,7 @@ import torch.nn as nn
 import logging
 import types
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Set
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
@@ -183,44 +183,25 @@ class RMSNorm(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """
-    Transformer block with connector-aware hidden state boosting.
+    """Transformer block - STANDARD (no boost here)."""
     
-    CORRECTED ARCHITECTURE:
-    1. Attention + residual
-    2. Feed forward + residual
-    3. Connector boost applied ONCE (at the end)
-    
-    This prevents compounding (1.1 only, not 1.1²).
-    Amplifies gradients for connector positions.
-    """
-    
-    def __init__(self, config: dict, boost_factor: float = 1.1):
+    def __init__(self, config: dict):
         super().__init__()
         self.attn = GroupedQueryAttention(config)
         self.ff = FeedForward(config)
         
         self.norm_attn = RMSNorm(config["emb_dim"], config["norm_eps"])
         self.norm_ff = RMSNorm(config["emb_dim"], config["norm_eps"])
-        
-        self.boost_factor = boost_factor
     
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         cos: Optional[torch.Tensor] = None,
-        sin: Optional[torch.Tensor] = None,
-        connector_mask: Optional[torch.Tensor] = None
+        sin: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        CORRECTED forward pass with connector boosting.
+        """Standard forward pass - no connector boosting."""
         
-        Flow:
-            x → norm → attention → residual → x₁
-            x₁ → norm → feed_forward → residual → x₂
-            x₂ → connector_boost → output (ONCE, no compounding)
-        """
         # Attention block with residual
         normed = self.norm_attn(x)
         attn_out = self.attn(normed, mask, cos, sin)
@@ -231,24 +212,33 @@ class TransformerBlock(nn.Module):
         ff_out = self.ff(normed)
         x = x + ff_out
         
-        # CONNECTOR BOOST: Applied ONCE at the end (no compounding)
-        if connector_mask is not None:
-            boost = connector_mask.unsqueeze(-1)
-            x = x * boost
-        
         return x
 
+
 class Llama3Model(nn.Module):
-    """Llama 3.2 with connector-aware hidden state boosting."""
+    """
+    Llama 3.2 with MULTI-WORD connector support.
     
-    def __init__(self, config: dict, boost_factor: float = 1.1):
+    UPDATED TO HANDLE:
+    - Single-word: <connector>because</connector>
+    - Multi-word: <connector>in conclusion</connector>
+    - Boosts ALL enclosed tokens equally
+    """
+    
+    def __init__(self, config: dict, tokenizer, boost_factor: float = 1.1):
         super().__init__()
         
-        # Store config as SimpleNamespace instead of dict
         self.config_dict = types.SimpleNamespace(**config)
         self.boost_factor = boost_factor
+        self.tokenizer = tokenizer
         
-        # Rest of initialization
+        # Token IDs for connector tags
+        self.connector_opening_tags: Set[int] = set()
+        self.connector_closing_tag_id: Optional[int] = None
+        
+        # Extract connector tag token IDs
+        self._setup_connector_tags()
+        
         self.token_emb = nn.Embedding(config["vocab_size"], config["emb_dim"])
         
         self.rope_emb = RoPEPositionalEmbedding(
@@ -257,25 +247,115 @@ class Llama3Model(nn.Module):
             rope_base=config["rope_base"]
         )
         
+        # Standard transformer blocks (no boost)
         self.trf_blocks = nn.ModuleList([
-            TransformerBlock(config, boost_factor=boost_factor)
+            TransformerBlock(config)
             for _ in range(config["n_layers"])
         ])
         
         self.norm_final = RMSNorm(config["emb_dim"], config["norm_eps"])
         self.out_head = nn.Linear(config["emb_dim"], config["vocab_size"], bias=False)
 
+    def _setup_connector_tags(self):
+        """Extract connector tag token IDs from tokenizer."""
+        logger.info("Extracting connector tag token IDs...")
+        
+        # Opening tags
+        opening_tag_templates = [
+            '<connector type="CAUSAL">',
+            '<connector type="ADVERSATIVE">',
+            '<connector type="TEMPORAL">',
+            '<connector type="CONDITIONAL">',
+            '<connector type="CONCLUSIVE">',
+            '<connector type="ADDITIVE">',
+        ]
+        
+        for tag_str in opening_tag_templates:
+            try:
+                token_id = self.tokenizer.encode(tag_str, add_special_tokens=False)
+                if len(token_id) == 1:
+                    self.connector_opening_tags.add(token_id[0])
+                    logger.debug(f"  Found: {tag_str} → ID {token_id[0]}")
+            except:
+                logger.warning(f"  Could not find: {tag_str}")
+        
+        # Closing tag
+        closing_tag_str = '</connector>'
+        try:
+            token_id = self.tokenizer.encode(closing_tag_str, add_special_tokens=False)
+            if len(token_id) == 1:
+                self.connector_closing_tag_id = token_id[0]
+                logger.debug(f"  Found: {closing_tag_str} → ID {token_id[0]}")
+        except:
+            logger.warning(f"  Could not find: {closing_tag_str}")
+        
+        logger.info(f"✓ Found {len(self.connector_opening_tags)} opening tags")
+        logger.info(f"✓ Found closing tag: {self.connector_closing_tag_id}")
+
+    def _create_boost_mask(self, in_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Create boost mask by detecting connector tag boundaries.
+        
+        UPDATED ALGORITHM:
+        1. Scan for opening connector tags
+        2. Mark ALL enclosed tokens until closing tag found
+        3. Support multi-word connector phrases
+        
+        Returns:
+            boost_mask: [batch, seq_len] with values 1.0 or 1.1
+        """
+        batch_size, seq_len = in_idx.shape
+        device = in_idx.device
+        
+        # Initialize mask (all 1.0)
+        boost_mask = torch.ones(batch_size, seq_len, device=device, dtype=torch.float32)
+        
+        # Process each sequence in batch
+        for batch_idx in range(batch_size):
+            sequence = in_idx[batch_idx]
+            
+            i = 0
+            while i < seq_len:
+                token_id = sequence[i].item()
+                
+                # Found an opening connector tag
+                if token_id in self.connector_opening_tags:
+                    logger.debug(f"Found opening tag at position {i}")
+                    
+                    # Scan forward to find closing tag
+                    closing_pos = None
+                    for j in range(i + 1, seq_len):
+                        if sequence[j].item() == self.connector_closing_tag_id:
+                            closing_pos = j
+                            break
+                    
+                    if closing_pos is not None:
+                        # BOOST ALL TOKENS BETWEEN opening and closing tags
+                        # This handles multi-word connectors!
+                        for pos in range(i + 1, closing_pos):
+                            boost_mask[batch_idx, pos] = self.boost_factor
+                        
+                        num_boosted = closing_pos - i - 1
+                        logger.debug(
+                            f"  Boosted {num_boosted} tokens (positions {i+1} to {closing_pos-1})"
+                        )
+                        
+                        # Skip past closing tag
+                        i = closing_pos + 1
+                    else:
+                        logger.warning(f"  No closing tag found after position {i}")
+                        i += 1
+                else:
+                    i += 1
+        
+        return boost_mask
+
     @property
     def config(self):
-        """Return config object for HuggingFace compatibility."""
-        
-        # Create a proper config wrapper class (not stored as instance attributes)
+        """Return config for HuggingFace."""
         class ConfigWrapper:
-            """Wrapper that provides config values AND HF-required methods."""
-            
             def __init__(self, config_ns):
                 self._config_ns = config_ns
-                # Add required special token IDs
                 self._config_ns.eos_token_id = 128009
                 self._config_ns.bos_token_id = 128000
                 self._config_ns.pad_token_id = 128009
@@ -283,25 +363,19 @@ class Llama3Model(nn.Module):
                 self._config_ns.use_cache = False
             
             def __getattr__(self, key):
-                """Delegate attribute access to wrapped config."""
                 return getattr(self._config_ns, key)
             
             def to_json_string(self):
-                """Return JSON string - only config data, NO functions."""
                 import json
-                # Filter out any non-serializable attributes
                 cfg_dict = {}
                 for key, value in vars(self._config_ns).items():
-                    # Only include serializable types
                     if isinstance(value, (str, int, float, bool, list, dict, type(None))):
                         cfg_dict[key] = value
                 return json.dumps(cfg_dict)
             
             def to_dict(self):
-                """Return config as dict - only data, NO functions."""
                 cfg_dict = {}
                 for key, value in vars(self._config_ns).items():
-                    # Only include serializable types
                     if isinstance(value, (str, int, float, bool, list, dict, type(None))):
                         cfg_dict[key] = value
                 return cfg_dict
@@ -314,108 +388,107 @@ class Llama3Model(nn.Module):
         connector_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Forward pass with connector-aware boosting.
+        Forward pass with multi-word connector support.
+        
+        HANDLES:
+        ✓ Single-word: "because"
+        ✓ Multi-word: "in general", "in conclusion", "for example"
+        ✓ Boosts ALL enclosed tokens equally
         
         Args:
             in_idx: [batch, seq_len] token IDs
-            connector_mask: [batch, seq_len] boost mask (1.0 or 1.1)
+            connector_mask: [OPTIONAL] If provided, use this
         
         Returns:
             logits: [batch, seq_len, vocab_size]
         """
         batch_size, seq_len = in_idx.shape
         
-        x = self.token_emb(in_idx)
+        # Create or use provided boost mask
+        if connector_mask is not None:
+            boost_mask = connector_mask.unsqueeze(-1)
+        else:
+            # Auto-detect connector tag boundaries (MULTI-WORD SUPPORT)
+            boost_mask_2d = self._create_boost_mask(in_idx)
+            boost_mask = boost_mask_2d.unsqueeze(-1)  # [batch, seq_len, 1]
         
+        # Embed tokens
+        x = self.token_emb(in_idx)  # [batch, seq_len, emb_dim]
+        
+        # BOOST CONNECTOR WORDS AT INPUT (MULTI-WORD SUPPORT)
+        x = x * boost_mask
+        
+        # Generate position embeddings
         cos, sin = self.rope_emb(seq_len, in_idx.device)
         
+        # Create causal mask
         mask = torch.triu(
             torch.ones(seq_len, seq_len, device=in_idx.device, dtype=torch.bool),
             diagonal=1
         ).unsqueeze(0)
         mask = ~mask
         
+        # Process through all transformer blocks (no boost)
         for block in self.trf_blocks:
-            x = block(x, mask, cos, sin, connector_mask)
+            x = block(x, mask, cos, sin)
         
+        # Final normalization
         x = self.norm_final(x)
         
+        # Output projection
         logits = self.out_head(x)
         
         return logits
 
+
 # ============================================================================
-# MODEL HANDLER (USES CONFIG.PY)
+# MODEL HANDLER
 # ============================================================================
 
 class Model:
-    """
-    Model handler for connector-boosted Llama 3.2.
-    
-    Imports from config.py for all settings:
-    - model_name: "meta-llama/Llama-3.2-3B"
-    - device: "cuda"
-    - boost_factor: 1.1
-    - Special tokens from get_special_tokens()
-    
-    Manages:
-    - Tokenizer loading and extension
-    - Model initialization with connector boosting
-    - Device management
-    - Checkpointing and loading
-    - Model information
-    """
+    """Model handler for Llama 3.2."""
 
     def __init__(self, config):
-        """Initialize from config.py"""
         self.config_dict = config
         self.tokenizer = None
         self.model = None
         self.original_vocab_size = None
         
-        # From config.py
         self.boost_factor = config.boost_factor
         
-        # Determine model size from model_name
         if "3B" in config.model_name:
             self.model_size = "3B"
         elif "1B" in config.model_name:
             self.model_size = "1B"
         else:
-            self.model_size = "1B"  # Default
+            self.model_size = "1B"
         
-        logger.info(f"Initialized Model handler")
-        logger.info(f"  Model: {config.model_name}")
-        logger.info(f"  Model size: {self.model_size}")
-        logger.info(f"  Device: {config.device}")
-        logger.info(f"  Boost factor: {self.boost_factor}")
+        logger.info(f"Model handler initialized")
+        logger.info(f"  Size: {self.model_size}")
+        logger.info(f"  Boost: {self.boost_factor}x (multi-word support)")
     
     @property
     def config(self):
-        """Return config object for HuggingFace Trainer compatibility."""
+        """Return config for Trainer."""
         class LlamaConfig:
             def __init__(self, cfg_dict):
                 for key, value in cfg_dict.items():
                     setattr(self, key, value)
-                # Llama 3.2 special tokens
                 self.eos_token_id = 128009
                 self.bos_token_id = 128000
                 self.pad_token_id = 128009
                 self.is_encoder_decoder = False
                 self.use_cache = False
         
-        # CORRECTED: Handle both dict and Config objects
         if isinstance(self.config_dict, dict):
             cfg_dict = self.config_dict
         else:
-            # If it's a Config object, convert to dict
             cfg_dict = self.config_dict.to_dict()
         
         return LlamaConfig(cfg_dict)
 
-
     def load_tokenizer(self):
-        """Load tokenizer from config.model_name."""
+        """Load tokenizer."""
         logger.info(f"Loading tokenizer: {self.config.model_name}")
         
         try:
@@ -424,235 +497,141 @@ class Model:
                 trust_remote_code=True
             )
         except Exception as e:
-            logger.error(f"Failed to load tokenizer: {e}")
+            logger.error(f"Failed: {e}")
             raise
         
-        # Set pad token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            logger.info(f"Set pad_token to eos_token")
         
         self.original_vocab_size = len(self.tokenizer)
-        logger.info(f"✓ Original vocab size: {self.original_vocab_size:,}")
+        logger.info(f"✓ Vocab: {self.original_vocab_size:,}")
         
         return self.tokenizer
     
     def extend_tokenizer(self, special_tokens):
-        """Add connector and other special tokens from config.py."""
+        """Add special tokens."""
         if not special_tokens:
             return 0
         
-        logger.info(f"Adding {len(special_tokens)} special tokens...")
-        
+        logger.info(f"Adding {len(special_tokens)} tokens...")
         num_added = self.tokenizer.add_tokens(special_tokens)
         
-        logger.info(f"✓ Added {num_added} tokens")
-        logger.info(f"✓ New vocab size: {len(self.tokenizer):,}")
-        
+        logger.info(f"✓ Added {num_added}, new vocab: {len(self.tokenizer):,}")
         return num_added
     
     def load_model(self):
-        """
-        Load Llama 3.2 model with connector boosting.
+        """Load model."""
+        logger.info(f"Loading Llama 3.2 ({self.model_size})")
+        logger.info(f"  Multi-word connector support: ENABLED")
         
-        Uses model_size determined from config.model_name.
-        """
-        logger.info(f"Loading Llama 3.2 ({self.model_size}) with connector boosting")
-        
-        # Get model config
         cfg = get_model_config(self.model_size)
-        
-        # Update vocab size to match extended tokenizer
         cfg["vocab_size"] = len(self.tokenizer)
-        logger.info(f"  Updated vocab_size: {cfg['vocab_size']:,}")
         
-        # Create model with connector boosting from config
-        self.model = Llama3Model(cfg, boost_factor=self.boost_factor)
+        self.model = Llama3Model(cfg, tokenizer=self.tokenizer, boost_factor=self.boost_factor)
         
-        # Move to device from config
         device = torch.device(self.config.device)
         self.model = self.model.to(device)
-        logger.info(f"  ✓ Model moved to device: {device}")
-        
-        logger.info(f"✓ Model loaded successfully")
+        logger.info(f"✓ On {device}")
         
         return self.model
     
     def get_model_info(self) -> Dict:
-        """Get model statistics and information."""
+        """Get model info."""
         if self.model is None:
-            logger.warning("Model not loaded")
             return {}
         
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        trainable_pct = 100 * trainable_params / total_params if total_params > 0 else 0
+        total = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         
-        device = str(next(self.model.parameters()).device)
-        dtype = str(next(self.model.parameters()).dtype)
-        
-        info = {
-            "model_name": self.config.model_name,
+        return {
             "model_type": f"Llama 3.2 ({self.model_size})",
-            "total_parameters": total_params,
-            "trainable_parameters": trainable_params,
-            "trainable_percentage": trainable_pct,
-            "original_vocab_size": self.original_vocab_size,
-            "current_vocab_size": len(self.tokenizer),
-            "device": device,
-            "dtype": dtype,
-            "connector_boosting": True,
-            "boost_factor": self.boost_factor
+            "total_parameters": total,
+            "trainable_percentage": 100 * trainable / total if total > 0 else 0,
+            "boost_factor": self.boost_factor,
+            "multi_word_support": "YES"
         }
-        
-        return info
     
     def print_model_info(self):
-        """Print comprehensive model information."""
+        """Print model info."""
         info = self.get_model_info()
         
         logger.info("\n" + "="*70)
         logger.info("MODEL INFORMATION")
         logger.info("="*70)
         logger.info(f"Model: {info.get('model_type', 'N/A')}")
-        logger.info(f"Total parameters: {info.get('total_parameters', 0):,}")
-        logger.info(f"Trainable: {info.get('trainable_parameters', 0):,} ({info.get('trainable_percentage', 0):.1f}%)")
-        logger.info(f"Vocab: {info.get('original_vocab_size', 0):,} → {info.get('current_vocab_size', 0):,}")
-        logger.info(f"Device: {info.get('device', 'N/A')}")
-        logger.info(f"Dtype: {info.get('dtype', 'N/A')}")
-        logger.info(f"Connector boosting: {info.get('connector_boosting', False)} ({info.get('boost_factor', 1.0)}x)")
+        logger.info(f"Parameters: {info.get('total_parameters', 0):,}")
+        logger.info(f"Trainable: {info.get('trainable_percentage', 0):.1f}%")
+        logger.info(f"\nConnector Boosting:")
+        logger.info(f"  Factor: {info.get('boost_factor', 1.0)}x")
+        logger.info(f"  Multi-word support: {info.get('multi_word_support', 'N/A')}")
+        logger.info(f"  Applied: At input (all enclosed tokens)")
+        logger.info(f"  Gradient amp: 1.1× only (not 1.1^28)")
         logger.info("="*70 + "\n")
     
     def save_model(self, output_path: str):
-        """Save model state dict and tokenizer."""
+        """Save model."""
         output_dir = Path(output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Saving model to {output_dir}")
+        logger.info(f"Saving to {output_dir}")
         
         try:
-            # Save model state dict
-            model_path = output_dir / "model.pt"
-            torch.save(self.model.state_dict(), model_path)
-            logger.info(f"✓ Model state dict saved")
-            
-            # Save tokenizer
+            torch.save(self.model.state_dict(), output_dir / "model.pt")
             self.tokenizer.save_pretrained(output_dir)
-            logger.info(f"✓ Tokenizer saved")
-            
-            # Save config
-            config_path = output_dir / "model_config.pt"
-            torch.save(self.model.config, config_path)
-            logger.info(f"✓ Model config saved")
-            
+            torch.save(self.model.config, output_dir / "model_config.pt")
+            logger.info("✓ Saved")
         except Exception as e:
-            logger.error(f"Error saving model: {e}", exc_info=True)
+            logger.error(f"Error: {e}", exc_info=True)
             raise
     
     def load_from_checkpoint(self, checkpoint_path: str) -> bool:
-        """Load model and tokenizer from checkpoint."""
+        """Load from checkpoint."""
         checkpoint_dir = Path(checkpoint_path)
         
         if not checkpoint_dir.exists():
-            logger.error(f"Checkpoint not found: {checkpoint_dir}")
+            logger.error(f"Not found: {checkpoint_dir}")
             return False
-        
-        logger.info(f"Loading from checkpoint: {checkpoint_dir}")
         
         try:
-            # Load model state dict
-            model_path = checkpoint_dir / "model.pt"
-            if model_path.exists():
-                device = torch.device(self.config.device)
-                state_dict = torch.load(model_path, map_location=device)
-                self.model.load_state_dict(state_dict)
-                logger.info(f"✓ Model loaded")
-            else:
-                logger.warning(f"Model file not found: {model_path}")
-                return False
-            
-            # Load tokenizer
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
-                logger.info(f"✓ Tokenizer loaded")
-            except Exception as e:
-                logger.warning(f"Could not load tokenizer: {e}")
-            
+            device = torch.device(self.config.device)
+            state_dict = torch.load(checkpoint_dir / "model.pt", map_location=device)
+            self.model.load_state_dict(state_dict)
+            logger.info("✓ Loaded")
             return True
-        
         except Exception as e:
-            logger.error(f"Error loading checkpoint: {e}", exc_info=True)
+            logger.error(f"Error: {e}", exc_info=True)
             return False
-    
-    def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing to save memory during training."""
-        logger.info("Enabling gradient checkpointing...")
-        
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
-            logger.info("✓ Gradient checkpointing enabled")
-        else:
-            logger.warning("Gradient checkpointing not available")
 
 
 def initialize_model(config) -> Model:
-    """
-    Initialize model with full setup from config.py.
-    
-    Usage:
-        from config import Config
-        config = Config()
-        model_handler = initialize_model(config)
-        
-        model = model_handler.model
-        tokenizer = model_handler.tokenizer
-    """
+    """Initialize model."""
     logger.info("\n" + "="*70)
-    logger.info("INITIALIZING LLAMA 3.2 MODEL (FROM CONFIG.PY)")
+    logger.info("INITIALIZING LLAMA 3.2 (MULTI-WORD SUPPORT)")
     logger.info("="*70)
     
-    # Create handler with config.py
     model_handler = Model(config)
     
-    # Load tokenizer
-    logger.info("\n[1/3] Loading tokenizer...")
+    logger.info("\n[1/3] Tokenizer...")
     model_handler.load_tokenizer()
     
-    # Extend tokenizer with special tokens from config.py
     logger.info("\n[2/3] Extending tokenizer...")
-    special_tokens = config.get_special_tokens()
-    model_handler.extend_tokenizer(special_tokens)
+    model_handler.extend_tokenizer(config.get_special_tokens())
     
-    # Load model
-    logger.info("\n[3/3] Loading model...")
+    logger.info("\n[3/3] Model...")
     model_handler.load_model()
     
-    # Print info
     model_handler.print_model_info()
     
     return model_handler
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    # Test with config.py
     try:
         from utils.config import Config
-        
-        logger.info("Loading config from config.py...")
         config = Config()
-        config.print_summary()
-        
-        logger.info("Initializing model...")
         model_handler = initialize_model(config)
-        
-        logger.info("✓ Test successful!")
-        
-    except ImportError:
-        logger.error("Please ensure config.py is in the same directory")
+        logger.info("✓ Success!")
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
