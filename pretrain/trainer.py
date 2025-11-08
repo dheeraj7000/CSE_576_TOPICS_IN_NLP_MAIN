@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-trainer.py - FULLY ALIGNED - FIXED FOR PARQUET STRUCTURE
-USES DIRECT COLUMN ACCESS from parquet files
+trainer.py - UPDATED FOR model_multiword_support.py
 
-Parquet structure:
+CRITICAL CHANGE:
+- Model.forward() now takes input_ids and optionally connector_mask
+- Model AUTOMATICALLY detects connector tags from input_ids
+- NO need to pass connector_mask from data (but it's optional for compatibility)
+- Data flow: parquet → input_ids + attention_mask → model detects tags → boost applied
+
+PARQUET STRUCTURE (Direct column access):
 - doc_id
 - domain
-- input_ids (list)
-- attention_mask (list)
+- input_ids (list) ← Used for tag detection
+- attention_mask (list) ← Standard attention mask (binary 0/1)
 - connector_count
 - connector_types (list)
 - connector_words (list)
 - token_count
 - connector_density
-- connector_mask (list)
-
-This trainer directly accesses these columns without any transformation.
+- connector_mask (list) ← OPTIONAL (can be ignored, model auto-detects)
 """
 
 import re
@@ -39,19 +42,20 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Direct Parquet Dataset (FIXED for direct column access)
+# Direct Parquet Dataset (UPDATED FOR AUTO TAG DETECTION)
 # ============================================================================
 
 class DirectParquetDataset(HFDataset):
     """
-    Load preprocessed parquet files directly with proper column access.
+    Load preprocessed parquet files directly.
+    
+    UPDATED: Model auto-detects connector tags from input_ids
+    No need to pass connector_mask (but kept for compatibility)
     
     Parquet columns:
-    - input_ids: tokenized text
-    - attention_mask: padding mask
-    - connector_mask: boosting mask (1.0/1.1)
-    - connector_words: list of connector words
-    - connector_types: list of connector types
+    - input_ids: tokenized text WITH connector tags
+    - attention_mask: binary mask (0/1)
+    - connector_mask: [OPTIONAL] not needed, model auto-detects
     """
     
     def __init__(self, parquet_path: str, max_files: Optional[int] = None):
@@ -59,7 +63,7 @@ class DirectParquetDataset(HFDataset):
         Initialize dataset from parquet files.
         
         Args:
-            parquet_path: Path to parquet file or directory containing parquet files
+            parquet_path: Path to parquet file or directory
             max_files: Limit number of files to load (optional)
         """
         self.parquet_path = Path(parquet_path)
@@ -108,7 +112,8 @@ class DirectParquetDataset(HFDataset):
         """
         Get item by index with proper type conversion.
         
-        Handles both string representations and actual lists.
+        UPDATED: Model auto-detects tags from input_ids
+        connector_mask is optional (not required for tag detection)
         """
         item = self.data[idx]
         
@@ -121,22 +126,19 @@ class DirectParquetDataset(HFDataset):
                     return value
             return value
         
-        # Extract and convert input_ids
+        # Extract and convert input_ids (with embedded connector tags)
         input_ids = parse_list(item.get("input_ids", []))
         if isinstance(input_ids, list):
             input_ids = torch.tensor(input_ids, dtype=torch.long)
         else:
             input_ids = torch.tensor(input_ids, dtype=torch.long)
         
-        # Extract and convert attention_mask
+        # Extract and convert attention_mask (binary 0/1)
         attention_mask = parse_list(item.get("attention_mask", []))
         if isinstance(attention_mask, list):
             attention_mask = torch.tensor(attention_mask, dtype=torch.long)
         else:
             attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-        
-        # Extract connector_mask if present (will be used by data_loader.py collator)
-        connector_mask = parse_list(item.get("connector_mask"))
         
         # Build return dictionary
         result = {
@@ -144,14 +146,15 @@ class DirectParquetDataset(HFDataset):
             "attention_mask": attention_mask,
         }
         
-        # Add optional fields
+        # OPTIONAL: Include connector_mask for loss weighting (if present in parquet)
+        connector_mask = parse_list(item.get("connector_mask"))
         if connector_mask is not None:
             if isinstance(connector_mask, list):
                 result["connector_mask"] = torch.tensor(connector_mask, dtype=torch.float)
             else:
                 result["connector_mask"] = torch.tensor(connector_mask, dtype=torch.float)
         
-        # Add other metadata
+        # Add optional metadata (not used by model, for logging)
         result["connector_words"] = parse_list(item.get("connector_words", []))
         result["connector_types"] = parse_list(item.get("connector_types", []))
         
@@ -166,54 +169,15 @@ class DirectParquetDataset(HFDataset):
 
 
 # ============================================================================
-# Enhanced Connector Annotator
-# ============================================================================
-
-class ConnectorAnnotator:
-    """Annotates text with connector markup using format: <connector type="x">word</connector>"""
-    
-    def __init__(self, connector_types: Dict[str, List[str]]):
-        """
-        Args:
-            connector_types: Dict mapping connector types to example words
-        """
-        self.connector_types = connector_types
-        self.patterns = self._build_patterns()
-        
-        self.start_token = "<connector"
-        self.end_token = "</connector>"
-    
-    def _build_patterns(self) -> Dict[str, re.Pattern]:
-        """Build regex patterns for each connector type"""
-        patterns = {}
-        for conn_type, connectors in self.connector_types.items():
-            sorted_connectors = sorted(connectors, key=len, reverse=True)
-            pattern = r'\b(' + '|'.join(re.escape(c) for c in sorted_connectors) + r')\b'
-            patterns[conn_type] = re.compile(pattern, re.IGNORECASE)
-        return patterns
-    
-    def annotate(self, text: str) -> str:
-        """Annotate text with connector markup using format: <connector type="x">word</connector>"""
-        if not text or not isinstance(text, str):
-            return text
-        
-        annotated = text
-        for conn_type, pattern in self.patterns.items():
-            annotated = pattern.sub(
-                lambda m: f'{self.start_token} type="{conn_type}">{m.group(0)}{self.end_token}',
-                annotated
-            )
-        return annotated
-
-
-# ============================================================================
-# Custom Loss Function
+# Custom Loss Function (UPDATED FOR AUTO TAG DETECTION)
 # ============================================================================
 
 class ConnectorAwareLoss(nn.Module):
     """
-    Custom loss that emphasizes connector tokens.
-    Works with mask values of 1.0 (normal) and 1.1 (connector)
+    Custom loss that weights connector tokens.
+    
+    UPDATED: Works with optional connector_mask
+    If mask not provided, all tokens weighted equally
     """
     
     def __init__(
@@ -226,7 +190,7 @@ class ConnectorAwareLoss(nn.Module):
         Args:
             vocab_size: Vocabulary size
             use_amplification: Additional amplification (optional)
-            amplification_strength: Additional amp factor (default: 1.0 = no extra amp)
+            amplification_strength: Additional amp factor (default: 1.0)
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -237,15 +201,17 @@ class ConnectorAwareLoss(nn.Module):
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        connector_mask: torch.Tensor
+        connector_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute weighted cross-entropy loss.
         
+        UPDATED: connector_mask is optional
+        
         Args:
             logits: [batch, seq_len, vocab_size]
             labels: [batch, seq_len]
-            connector_mask: [batch, seq_len] with values 1.0 or 1.1
+            connector_mask: [batch, seq_len] with values 1.0 or 1.1 (OPTIONAL)
         
         Returns:
             loss: scalar
@@ -253,12 +219,10 @@ class ConnectorAwareLoss(nn.Module):
         # Shift for next-token prediction
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        shift_connector_mask = connector_mask[..., 1:].contiguous()
         
         # Flatten
         shift_logits_flat = shift_logits.view(-1, self.vocab_size)
         shift_labels_flat = shift_labels.view(-1)
-        shift_connector_flat = shift_connector_mask.view(-1)
         
         # Compute per-token loss
         loss_per_token = F.cross_entropy(
@@ -268,12 +232,17 @@ class ConnectorAwareLoss(nn.Module):
             reduction='none'
         )
         
-        # Use mask values directly as weights
-        weights = shift_connector_flat
+        # Apply connector_mask weighting if provided
+        if connector_mask is not None:
+            shift_connector_flat = connector_mask[..., 1:].contiguous().view(-1)
+            weights = shift_connector_flat
+        else:
+            # No mask provided - equal weight for all tokens
+            weights = torch.ones_like(loss_per_token)
         
-        # Apply additional amplification if enabled (OPTIONAL)
+        # Apply additional amplification if enabled
         if self.use_amplification and self.amplification_strength > 1.0:
-            is_connector = (shift_connector_flat > 1.05).float()
+            is_connector = (weights > 1.05).float()
             amplification = 1.0 + is_connector * (self.amplification_strength - 1.0)
             weights = weights * amplification
         
@@ -289,28 +258,30 @@ class ConnectorAwareLoss(nn.Module):
 
 
 # ============================================================================
-# Fallback Data Collator
+# Fallback Data Collator (UPDATED FOR AUTO TAG DETECTION)
 # ============================================================================
 
 class ConnectorAwareDataCollator:
-    """Fallback data collator that creates connector masks"""
+    """
+    Fallback data collator that handles input_ids + attention_mask.
+    
+    UPDATED: Model auto-detects connector tags from input_ids
+    No need to create masks here
+    """
     
     def __init__(
         self,
         tokenizer,
-        annotator: ConnectorAnnotator,
         max_length: int = 2048
     ):
         self.tokenizer = tokenizer
-        self.annotator = annotator
         self.max_length = max_length
     
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
-        """Collate batch with connector masks"""
+        """Collate batch"""
         
-        # Check if examples already have input_ids
         if examples and 'input_ids' in examples[0]:
-            # Already tokenized - just pad
+            # Already tokenized with connector tags - just pad
             batch = self.tokenizer.pad(
                 examples,
                 padding=True,
@@ -327,21 +298,27 @@ class ConnectorAwareDataCollator:
         batch["labels"] = batch["input_ids"].clone()
         batch["labels"][batch["labels"] == self.tokenizer.pad_token_id] = -100
         
-        # Create dummy connector_mask (all 1.0) if not present
-        if "connector_mask" not in batch:
-            batch["connector_mask"] = torch.ones_like(batch["input_ids"], dtype=torch.float)
+        # OPTIONAL: Include connector_mask if present (for loss weighting)
+        if examples and 'connector_mask' in examples[0]:
+            connector_masks = torch.stack([e['connector_mask'] for e in examples])
+            # Pad connector_mask to match batch length
+            padded_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
+            padded_mask[:, :connector_masks.shape[1]] = connector_masks
+            batch["connector_mask"] = padded_mask
         
         return batch
 
 
 # ============================================================================
-# Custom Trainer
+# Custom Trainer (UPDATED FOR AUTO TAG DETECTION)
 # ============================================================================
 
 class ConnectorAwareTrainer(Trainer):
     """
     Trainer with custom connector-aware loss.
-    Works with Llama3Model from model.py
+    
+    UPDATED: Model auto-detects connector tags from input_ids
+    Trainer just passes input_ids and optional connector_mask
     """
     
     def __init__(
@@ -354,39 +331,40 @@ class ConnectorAwareTrainer(Trainer):
         self.loss_fn = loss_fn
     
     def _align_special_tokens(self):
-        """
-        Override to skip HF Trainer's config validation.
-        Our custom model handles special tokens correctly.
-        """
+        """Override to skip HF Trainer's config validation."""
         pass
     
     def setup_callbacks(self):
-        """Override to disable problematic callbacks for custom models."""
+        """Override to disable problematic callbacks."""
         super().setup_callbacks()
-        
         self.log_model = False
         self.report_to = []
-        
-        logger.info("✓ Disabled HF integration callbacks for custom model compatibility")
+        logger.info("✓ Disabled HF integration callbacks")
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Compute standard causal LM loss."""
-        connector_mask = inputs.pop("connector_mask", None)
+        """
+        Compute loss.
+        
+        UPDATED: Model auto-detects connector tags from input_ids
+        connector_mask is optional for loss weighting
+        """
+        connector_mask = inputs.pop("connector_mask", None)  # OPTIONAL
         labels = inputs.get("labels")
         input_ids = inputs.get("input_ids")
         
         # Forward pass
+        # Model auto-detects tags from input_ids
         logits = model(
             in_idx=input_ids,
-            connector_mask=connector_mask
+            connector_mask=connector_mask  # OPTIONAL (for loss weighting)
         )
         
         # Custom loss
-        if labels is not None and connector_mask is not None:
+        if labels is not None:
             loss = self.loss_fn(
                 logits=logits,
                 labels=labels,
-                connector_mask=connector_mask
+                connector_mask=connector_mask  # OPTIONAL
             )
         else:
             loss = F.cross_entropy(
@@ -401,14 +379,14 @@ class ConnectorAwareTrainer(Trainer):
 
 
 # ============================================================================
-# Main Pretraining Manager
+# Main Pretraining Manager (UPDATED FOR AUTO TAG DETECTION)
 # ============================================================================
 
 class ConnectorPretrainingManager:
     """
     Main class for managing connector-aware pretraining.
     
-    FIXED: Directly accesses parquet columns without transformation
+    UPDATED: Model auto-detects connector tags from input_ids
     """
     
     def __init__(self, config, model_handler, use_new_collator: bool = True):
@@ -422,62 +400,37 @@ class ConnectorPretrainingManager:
         self.model_handler = model_handler
         self.use_new_collator = use_new_collator
         
-        # Initialize components
-        self.annotator = ConnectorAnnotator(config.connector_types)
         self.loss_fn = None
         self.trainer = None
         
         logger.info("\n" + "="*70)
-        logger.info("CONNECTOR PRETRAINING MANAGER (PARQUET FIXED)")
+        logger.info("CONNECTOR PRETRAINING MANAGER")
+        logger.info("UPDATED FOR model_multiword_support.py")
         logger.info("="*70)
         logger.info(f"Model: {config.model_name}")
         logger.info(f"Device: {config.device}")
         logger.info(f"Boost factor: {config.boost_factor}")
-        logger.info(f"Architectural boosting: ENABLED")
-        logger.info(f"TAG FORMAT: <connector type=\"x\">word</connector>")
-        logger.info(f"Parquet columns: Direct access to input_ids, attention_mask, connector_mask")
-        if use_new_collator:
-            logger.info(f"Data collator: ConnectorDataCollatorWithMaskCreation (from data_loader.py)")
-        else:
-            logger.info(f"Data collator: ConnectorAwareDataCollator (FALLBACK)")
+        logger.info(f"\n✓ Model auto-detects connector tags from input_ids")
+        logger.info(f"✓ Boost applied at embedding layer")
+        logger.info(f"✓ Multi-word connector support: YES")
+        logger.info(f"✓ Parquet columns: Direct access to input_ids, attention_mask")
         logger.info("="*70 + "\n")
     
     def _load_dataset_from_parquet(self, parquet_path: str, max_files: Optional[int] = None) -> HFDataset:
-        """
-        Load dataset directly from parquet files.
-        
-        Args:
-            parquet_path: Path to parquet files
-            max_files: Optional limit on number of files
-            
-        Returns:
-            HFDataset compatible dataset
-        """
-        logger.info(f"\n[PARQUET] Loading dataset from: {parquet_path}")
+        """Load dataset from parquet files."""
+        logger.info(f"\nLoading dataset from parquet: {parquet_path}")
         
         dataset = DirectParquetDataset(parquet_path, max_files=max_files)
         
-        logger.info(f"✓ Loaded {len(dataset):,} samples from parquet")
+        logger.info(f"✓ Loaded {len(dataset):,} samples")
         return dataset
     
     def _load_dataset_from_hf_format(self, dataset_path: str) -> HFDataset:
-        """
-        Load dataset from HuggingFace format.
-        
-        Args:
-            dataset_path: Path to HF dataset directory
-            
-        Returns:
-            HFDataset instance
-        """
-        logger.info(f"\n[HF FORMAT] Loading dataset from: {dataset_path}")
+        """Load dataset from HuggingFace format."""
+        logger.info(f"\nLoading dataset from HF format: {dataset_path}")
         
         dataset = load_from_disk(dataset_path)
-        
-        if hasattr(dataset, 'keys'):  # DatasetDict
-            logger.info(f"✓ Loaded DatasetDict with splits: {list(dataset.keys())}")
-        else:
-            logger.info(f"✓ Loaded {len(dataset):,} samples")
+        logger.info(f"✓ Loaded dataset")
         
         return dataset
     
@@ -495,18 +448,10 @@ class ConnectorPretrainingManager:
         **kwargs
     ):
         """
-        Prepare trainer with custom loss and data collator.
+        Prepare trainer.
         
-        Args:
-            train_dataset: Training dataset (from parquet or HF format)
-            eval_dataset: Evaluation dataset (optional)
-            output_dir: Output directory for checkpoints
-            use_amplification: Additional loss amplification
-            amplification_strength: Additional amp factor
-            boost_factor: Connector boost factor
-            num_epochs: Number of training epochs
-            batch_size: Per-device batch size
-            learning_rate: Learning rate
+        UPDATED: Model auto-detects connector tags
+        No need for special tag handling
         """
         logger.info("\n" + "="*70)
         logger.info("PREPARING TRAINER")
@@ -526,7 +471,6 @@ class ConnectorPretrainingManager:
         logger.info(f"\n[2/3] Setting up data collator...")
         
         if self.use_new_collator:
-            # USE ConnectorDataCollatorWithMaskCreation from data_loader.py
             try:
                 from pretrain.data_loader import ConnectorDataCollatorWithMaskCreation
                 
@@ -535,24 +479,19 @@ class ConnectorPretrainingManager:
                     pad_token_id=self.model_handler.tokenizer.pad_token_id,
                     boost_factor=boost_factor
                 )
-                logger.info("✓ Using ConnectorDataCollatorWithMaskCreation (from data_loader.py)")
-                logger.info(f"  - Masks created on-the-fly")
-                logger.info(f"  - Boost values: 1.0 (normal) or {boost_factor} (connector)")
+                logger.info("✓ Using ConnectorDataCollatorWithMaskCreation")
                 
-            except ImportError as e:
-                logger.error(f"❌ IMPORT ERROR: {e}")
-                logger.warning("⚠ Falling back to original collator...")
+            except ImportError:
+                logger.warning("⚠ Falling back to simple collator...")
                 self.use_new_collator = False
                 data_collator = ConnectorAwareDataCollator(
                     tokenizer=self.model_handler.tokenizer,
-                    annotator=self.annotator,
                     max_length=getattr(self.config, 'max_length', 2048)
                 )
         else:
-            logger.info("✓ Using ConnectorAwareDataCollator (FALLBACK)")
+            logger.info("✓ Using ConnectorAwareDataCollator")
             data_collator = ConnectorAwareDataCollator(
                 tokenizer=self.model_handler.tokenizer,
-                annotator=self.annotator,
                 max_length=getattr(self.config, 'max_length', 2048)
             )
         
@@ -625,22 +564,24 @@ class ConnectorPretrainingManager:
         logger.info(f"Training samples: {len(train_dataset):,}")
         if eval_dataset:
             logger.info(f"Evaluation samples: {len(eval_dataset):,}")
-        logger.info(f"\nConnector Boosting:")
-        logger.info(f"  Location: Architecture (TransformerBlock)")
-        logger.info(f"  Boost factor: {boost_factor}x")
-        logger.info(f"  Application: Hidden state multiplication")
-        logger.info(f"\nData Structure:")
-        logger.info(f"  Parquet columns: Direct access (no transformation)")
-        logger.info(f"  input_ids: Extracted from parquet")
-        logger.info(f"  attention_mask: Extracted from parquet")
-        logger.info(f"  connector_mask: Extracted or created on-the-fly")
-        logger.info(f"\nLoss Function:")
-        logger.info(f"  Base: Cross-entropy")
-        logger.info(f"  Weighting: connector_mask values (1.0 or {boost_factor})")
-        logger.info(f"\nTraining Settings:")
-        logger.info(f"  Epochs: {num_epochs}")
-        logger.info(f"  Batch size: {batch_size}")
-        logger.info(f"  Learning rate: {learning_rate}")
+        
+        logger.info(f"\n✓ Connector-aware Features:")
+        logger.info(f"  - Auto tag detection: ENABLED")
+        logger.info(f"  - Multi-word support: ENABLED")
+        logger.info(f"  - Boost applied at: Input embedding layer")
+        logger.info(f"  - Boost factor: {boost_factor}x")
+        logger.info(f"  - Gradient amplification: 1.1× (not 1.1^28)")
+        
+        logger.info(f"\n✓ Data Flow:")
+        logger.info(f"  - Parquet → input_ids (with tags)")
+        logger.info(f"  - Model detects tag boundaries")
+        logger.info(f"  - Boosts enclosed tokens by {boost_factor}×")
+        logger.info(f"  - Passes through 28 unchanged layers")
+        
+        logger.info(f"\n✓ Training Settings:")
+        logger.info(f"  - Epochs: {num_epochs}")
+        logger.info(f"  - Batch size: {batch_size}")
+        logger.info(f"  - Learning rate: {learning_rate}")
         logger.info("="*70 + "\n")
     
     def train(self):
@@ -686,12 +627,11 @@ if __name__ == "__main__":
     )
     
     logger.info("="*70)
-    logger.info("Trainer module - PARQUET FIXED VERSION")
+    logger.info("Trainer module - UPDATED FOR model_multiword_support.py")
     logger.info("="*70)
-    logger.info("Direct column access from parquet files:")
-    logger.info("  - input_ids")
-    logger.info("  - attention_mask")
-    logger.info("  - connector_mask")
-    logger.info("  - connector_words")
-    logger.info("  - connector_types")
+    logger.info("\n✓ Key Features:")
+    logger.info("  - Auto connector tag detection from input_ids")
+    logger.info("  - Multi-word connector support")
+    logger.info("  - Direct parquet column access")
+    logger.info("  - Optional connector_mask for loss weighting")
     logger.info("="*70)
