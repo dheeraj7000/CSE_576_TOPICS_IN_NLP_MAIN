@@ -53,7 +53,7 @@ class Config:
     # ========== CONNECTOR TYPES (COMPLETE) ==========
     # Each list contains single-word AND multi-word connector phrases
     connector_types: Dict[str, List[str]] = field(default_factory=lambda: {
-        'causal': [
+        'CASUAL': [
             # Single-word
             'because', 'since', 'as', 'for', 'therefore', 'thus',
             'hence', 'consequently', 'accordingly', 'so',
@@ -67,7 +67,7 @@ class Config:
             'with the aim of', 'for the purpose of', 'with a view to',
             'to the end that'
         ],
-        'adversative': [
+        'ADVERSATIVE': [
             # Single-word
             'but', 'however', 'yet', 'whereas', 'while', 'although',
             'though', 'despite', 'nonetheless',
@@ -83,7 +83,7 @@ class Config:
             'at any rate', 'in any case', 'in any event', 'after all',
             'at the same time'
         ],
-        'temporal': [
+        'TEMPORAL': [
             # Single-word
             'when', 'while', 'as', 'whenever', 'before', 'after',
             'then', 'first', 'second', 'third', 'finally', 'last',
@@ -99,7 +99,7 @@ class Config:
             'immediately after', 'firstly', 'secondly', 'thirdly',
             'in the end', 'to begin with', 'to start with', 'initially'
         ],
-        'conditional': [
+        'CONDITIONAL': [
             # Single-word
             'if', 'when', 'whenever', 'once', 'unless',
             # Multi-word
@@ -109,7 +109,7 @@ class Config:
             'if not', 'only if', 'but for', 'save that',
             'were it not for', 'if it were not for'
         ],
-        'conclusive': [
+        'CONCLUSIVE': [
             # Single-word
             'therefore', 'thus', 'hence', 'so',
             # Multi-word
@@ -121,7 +121,7 @@ class Config:
             'i.e.', 'viz.', 'finally', 'last but not least',
             'in the final analysis', 'at last', 'ultimately', 'in the end'
         ],
-        'additive': [
+        'ADDITIVE': [
             # Single-word
             'and', 'also', 'too', 'plus',
             # Multi-word

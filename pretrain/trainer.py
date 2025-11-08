@@ -501,44 +501,40 @@ class ConnectorPretrainingManager:
         training_args = TrainingArguments(
             output_dir=output_dir,
             overwrite_output_dir=True,
-            
+
             # Training
             num_train_epochs=num_epochs,
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=batch_size,
             gradient_accumulation_steps=1,
-            
+
             # Optimization
             learning_rate=learning_rate,
             weight_decay=0.01,
             warmup_steps=500,
             lr_scheduler_type="cosine",
             max_grad_norm=1.0,
-            
+
             # Precision
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
             fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
-            
+
             # Logging
             logging_steps=50,
             logging_dir=f"{output_dir}/logs",
-            
-            # Evaluation
+            report_to=["tensorboard"],          # (explicit, now that TB is installed)
+
+            # Evaluation / Saving (as you already had)
             eval_strategy="steps" if eval_dataset else "no",
             eval_steps=500 if eval_dataset else None,
-            
-            # Saving
             save_strategy="steps",
             save_steps=1000,
             save_total_limit=3,
-            
-            # Reporting
-            report_to="tensorboard",
-            run_name="connector_pretrain",
-            dataloader_num_workers=4,
-            dataloader_pin_memory=True,
+
+            # >>> THE IMPORTANT LINE <<<
+            remove_unused_columns=False
         )
-        
+                
         logger.info("✓ Training arguments configured")
         
         # Create trainer
