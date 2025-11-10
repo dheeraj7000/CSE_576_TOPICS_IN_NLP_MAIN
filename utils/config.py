@@ -1,67 +1,50 @@
 #!/usr/bin/env python3
 """
-config.py - FINAL MERGED VERSION
+config.py - CORRECTED VERSION
 
-COMBINES:
-1. Query config: CUDA optimization, cleaner structure, device handling
-2. Uploaded config: Complete connector patterns, comprehensive settings
-3. VALIDATED APPROACH: Multi-word connector support, architectural boost
-
-TAG FORMAT: <connector type="X">word(s)</connector>
-CONNECTOR TYPES: 6 categories with multi-word support
-BOOST: 1.1× at input (multi-word support)
+Fixed: Proper connector tag formats that encode as SINGLE tokens.
+These tags ARE added to tokenizer vocab as special tokens.
 """
 
 import os
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dataclasses import dataclass, field, asdict
 
 
 @dataclass
 class Config:
-    """
-    Configuration for connector-aware pretraining.
-    OPTIMIZED FOR: Llama 3.2 3B on CUDA
-    """
+    """Configuration for connector-aware pretraining."""
     
-    # ========== MODEL CONFIGURATION ==========
+    # Model Configuration
     model_name: str = "meta-llama/Llama-3.2-3B"
-    device: str = "cuda"  # "cuda", "cpu", "auto"
-    torch_dtype: str = "bfloat16"  # Better stability for Llama
+    device: str = "cuda"
+    torch_dtype: str = "bfloat16"
     
-    # ========== CONNECTOR BOOSTING ==========
+    # Connector Boosting
     use_connector_boost: bool = True
-    boost_factor: float = 1.1  # Applied at input (multi-word support)
-    boost_applies_to: str = "connector_words"  # Only connector words, not tags
+    boost_factor: float = 1.1
+    boost_applies_to: str = "connector_words"
     
-    # ========== TAG FORMAT ==========
-    # Supports both single and multi-word connectors
+    # Tag Format - CORRECTED: Proper format tags
     tag_format: str = '<connector type="{type}">{word}</connector>'
     opening_tag_format: str = '<connector type="{type}">'
     closing_tag: str = '</connector>'
     
-    # ========== LORA SETTINGS ==========
-    use_lora: bool = False  # Llama 3.2 3B can do full fine-tuning
+    # LoRA Settings
+    use_lora: bool = False
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.1
     lora_target_modules: List[str] = field(default_factory=lambda: [
-        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
-        "gate_proj", "up_proj", "down_proj"       # FFN
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
     ])
     
-    # ========== CONNECTOR TYPES (COMPLETE) ==========
-    # Each list contains single-word AND multi-word connector phrases
+    # Connector Types with Multi-word Support
     connector_types: Dict[str, List[str]] = field(default_factory=lambda: {
-<<<<<<< HEAD
         'CAUSAL': [
-=======
-        'CASUAL': [
-            # Single-word
->>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
             'because', 'since', 'as', 'for', 'therefore', 'thus',
             'hence', 'consequently', 'accordingly', 'so',
-            # Multi-word
             'as a result', 'as a consequence', 'for this reason',
             'that is why', 'thereby', 'wherefore', 'ergo',
             'given that', 'seeing that', 'in that', 'inasmuch as',
@@ -72,13 +55,8 @@ class Config:
             'to the end that'
         ],
         'ADVERSATIVE': [
-<<<<<<< HEAD
-=======
-            # Single-word
->>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
             'but', 'however', 'yet', 'whereas', 'while', 'although',
             'though', 'despite', 'nonetheless',
-            # Multi-word
             'on the contrary', 'in contrast', 'conversely', 'by contrast',
             'on the other hand', 'in opposition to', 'as opposed to',
             'rather than', 'unlike', 'even though', 'even if',
@@ -91,14 +69,9 @@ class Config:
             'at the same time'
         ],
         'TEMPORAL': [
-<<<<<<< HEAD
-=======
-            # Single-word
->>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
             'when', 'while', 'as', 'whenever', 'before', 'after',
             'then', 'first', 'second', 'third', 'finally', 'last',
             'eventually', 'ultimately', 'during', 'throughout',
-            # Multi-word
             'as long as', 'at the same time', 'simultaneously', 'meantime',
             'meanwhile', 'in the meantime', 'at that moment', 'at that time',
             'just then', 'prior to', 'previously', 'earlier', 'formerly',
@@ -110,23 +83,7 @@ class Config:
             'in the end', 'to begin with', 'to start with', 'initially'
         ],
         'CONDITIONAL': [
-<<<<<<< HEAD
-            'if', 'when', 'whenever', 'once', 'assuming',
-            'provided that', 'given that', 'in case', 'unless'
-        ],
-        'CONCLUSIVE': [
-            'therefore', 'thus', 'hence', 'so', 'in conclusion',
-            'to conclude', 'in summary', 'to summarize', 'in short',
-            'overall', 'in general', 'finally', 'ultimately'
-        ],
-        'ADDITIVE': [
-            'and', 'also', 'too', 'moreover', 'furthermore',
-            'in addition', 'besides', 'likewise', 'similarly',
-            'for example', 'for instance', 'such as', 'particularly'
-=======
-            # Single-word
             'if', 'when', 'whenever', 'once', 'unless',
-            # Multi-word
             'assuming that', 'provided that', 'providing that',
             'given that', 'granted that', 'on condition that',
             'in the event that', 'in case', 'just in case', 'except if',
@@ -134,9 +91,7 @@ class Config:
             'were it not for', 'if it were not for'
         ],
         'CONCLUSIVE': [
-            # Single-word
             'therefore', 'thus', 'hence', 'so',
-            # Multi-word
             'in conclusion', 'to conclude', 'in summary', 'to summarize',
             'to sum up', 'in sum', 'in short', 'in brief', 'all in all',
             'on the whole', 'overall', 'in overview', 'in general',
@@ -146,9 +101,7 @@ class Config:
             'in the final analysis', 'at last', 'ultimately', 'in the end'
         ],
         'ADDITIVE': [
-            # Single-word
             'and', 'also', 'too', 'plus',
-            # Multi-word
             'as well', 'moreover', 'furthermore', 'in addition',
             'additionally', 'besides', 'what is more', 'on top of that',
             'along with', 'together with', 'coupled with', 'not to mention',
@@ -161,41 +114,40 @@ class Config:
             'such as', 'namely', 'e.g.', 'to illustrate',
             'to demonstrate', 'as an illustration', 'in particular',
             'particularly', 'especially'
->>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
         ]
     })
     
-    # ========== OPTIMIZATION SETTINGS ==========
-    use_flash_attention: bool = False  # Not needed for 3B
-    use_fsdp: bool = False  # Single GPU
-    use_deepspeed: bool = False  # Single GPU
-    gradient_checkpointing: bool = False  # 3B is small enough
+    # Optimization Settings
+    use_flash_attention: bool = False
+    use_fsdp: bool = False
+    use_deepspeed: bool = False
+    gradient_checkpointing: bool = False
     
-    # ========== TRAINING CONFIGURATION ==========
+    # Training Configuration
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 4
-    per_device_eval_batch_size: int = 4
-    gradient_accumulation_steps: int = 8
+    per_device_train_batch_size: int = 16
+    per_device_eval_batch_size: int = 16
+    gradient_accumulation_steps: int = 4
     learning_rate: float = 5e-6
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
-    # ========== SEQUENCE CONFIGURATION ==========
-    max_sequence_length: int = 8192  # Llama 3.2 context
+    # Sequence Configuration
+    max_sequence_length: int = 8192
     max_length: int = 8192
     
-    # ========== DATASET CONFIGURATION ==========
+    # Dataset Configuration
     combined_dataset_path: str = "./combined_dataset_sample"
     
-    # ========== PREPROCESSING CONFIGURATION ==========
+    # Preprocessing Configuration
     checkpoint_size: int = 1000
     min_paper_length: int = 50
     max_paper_length: int = 500000
     checkpoint_dir: str = "./checkpoints"
     CHECKPOINT_DIR: str = "./checkpoints"
     
-    # ========== LOGGING ==========
+    # Logging
     save_text_preview: bool = True
     preview_length: int = 500
     log_level: str = "INFO"
@@ -203,35 +155,24 @@ class Config:
     eval_steps: int = 500
     save_steps: int = 1000
     
-    # ========== PERFORMANCE ==========
+    # Performance - OPTIMIZED
     num_workers: int = 4
     batch_size: int = 10000
-    dataloader_num_workers: int = 0  # CRITICAL: No multiprocessing
-    dataloader_pin_memory: bool = False  # Safe for data loading
+    dataloader_num_workers: int = 4
+    dataloader_pin_memory: bool = True
     dataloader_prefetch_factor: int = 2
     
-    # ========== HELPER METHODS ==========
-    
+    # Helper Methods
     def get_special_tokens(self) -> List[str]:
-        """
-        Get special tokens for tokenizer.
-        
-        Returns:
-            List with opening tags (one per category) + closing tag
-        """
+        """Get special tokens for tokenizer."""
         tokens = []
-        
-        # Opening tags
         for conn_type in self.connector_types.keys():
             tokens.append(self.opening_tag_format.format(type=conn_type.upper()))
-        
-        # Closing tag
         tokens.append(self.closing_tag)
-        
         return tokens
     
     def get_connector_type_names(self) -> List[str]:
-        """Get connector type names (uppercase)."""
+        """Get connector type names."""
         return [conn_type.upper() for conn_type in self.connector_types.keys()]
     
     def validate(self) -> bool:
@@ -241,12 +182,14 @@ class Config:
         assert len(self.connector_types) > 0, "Must have at least one connector type"
         assert self.device in ["cuda", "cpu", "auto"], f"Invalid device: {self.device}"
         
-        # Validate CUDA if needed
+        # Validate tag format
+        assert self.opening_tag_format, "opening_tag_format cannot be empty!"
+        assert self.closing_tag, "closing_tag cannot be empty!"
+        
         if self.device == "cuda":
             import torch
             if not torch.cuda.is_available():
                 print("⚠️  WARNING: CUDA requested but not available!")
-                print("    Falling back to CPU")
                 self.device = "cpu"
         
         return True
@@ -264,7 +207,6 @@ class Config:
         print(f"Device: {self.device}")
         print(f"Dtype: {self.torch_dtype}")
         
-        # Check CUDA
         try:
             import torch
             if torch.cuda.is_available():
@@ -279,11 +221,11 @@ class Config:
         print(f"\nConnector Boosting:")
         print(f"  Enabled: {self.use_connector_boost}")
         print(f"  Factor: {self.boost_factor}×")
-        print(f"  Applies to: {self.boost_applies_to}")
-        print(f"  Multi-word support: YES")
         
-        print(f"\nLoRA:")
-        print(f"  Enabled: {self.use_lora}")
+        print(f"\nTag Format:")
+        print(f"  Opening: {self.opening_tag_format}")
+        print(f"  Closing: {self.closing_tag}")
+        print(f"  Full:    {self.tag_format}")
         
         print(f"\nTraining:")
         print(f"  Epochs: {self.num_train_epochs}")
@@ -294,22 +236,21 @@ class Config:
         
         print(f"\nConnector Types: {len(self.connector_types)}")
         for conn_type, words in self.connector_types.items():
-            print(f"  • {conn_type.upper()}: {len(words)} connector phrases (including multi-word)")
+            print(f"  • {conn_type.upper()}: {len(words)} phrases")
         
         print(f"\nSpecial Tokens: {len(self.get_special_tokens())}")
-        print(f"Tag Format: {self.tag_format}")
-        print(f"Checkpoint Directory: {self.checkpoint_dir}")
-        print(f"Data Workers: {self.dataloader_num_workers} (NO MULTIPROCESSING)")
+        tokens = self.get_special_tokens()
+        print(f"  Sample: {tokens[:2]}")
+        
+        print(f"\nData Loading:")
+        print(f"  Workers: {self.dataloader_num_workers} (parallel)")
+        print(f"  Pin memory: {self.dataloader_pin_memory}")
+        
         print("=" * 70 + "\n")
 
 
-# ============================================================================
-# MODULE-LEVEL CONSTANTS
-# ============================================================================
-
+# Module-level exports
 _default_config = Config()
-
-# Export constants
 BASE_MODEL = _default_config.model_name
 CONNECTOR_ATTENTION_WEIGHT = _default_config.boost_factor
 MAX_SEQUENCE_LENGTH = _default_config.max_sequence_length
@@ -326,7 +267,7 @@ def get_connector_types() -> List[str]:
 def verify_configuration():
     """Verify configuration."""
     print("\n" + "=" * 70)
-    print("CONFIGURATION VERIFICATION - LLAMA-3.2-3B ON CUDA")
+    print("CONFIGURATION VERIFICATION - LLAMA-3.2-3B")
     print("=" * 70)
     
     config = _default_config
@@ -334,39 +275,31 @@ def verify_configuration():
     
     print(f"✓ Model: {config.model_name}")
     print(f"✓ Device: {config.device}")
-    print(f"✓ Tag format: {TAG_FORMAT}")
-    print(f"✓ Boost factor: {config.boost_factor}x (multi-word support)")
-    print(f"✓ LoRA: {'Enabled' if config.use_lora else 'Disabled'}")
+    print(f"✓ Opening tag format: {config.opening_tag_format}")
+    print(f"✓ Closing tag format: {config.closing_tag}")
+    print(f"✓ Boost factor: {config.boost_factor}x")
     print(f"✓ Special tokens: {len(SPECIAL_TOKENS)}")
     print(f"✓ Connector types: {len(config.connector_types)}")
-    print(f"✓ Checkpoint dir: {CHECKPOINT_DIR}")
-    print(f"✓ Data workers: {config.dataloader_num_workers} (NO MULTIPROCESSING)")
     
-    print("\nConnector types and multi-word support:")
+    print(f"\nSpecial tokens:")
+    for i, token in enumerate(SPECIAL_TOKENS, 1):
+        print(f"  {i}. {token}")
+    
+    print(f"\nConnector types:")
     for ctype, words in config.connector_types.items():
-        # Show some examples
-        multi_word = [w for w in words if ' ' in w]
         print(f"  - {ctype.upper()}: {len(words)} phrases")
-        if multi_word:
-            print(f"    Examples: {', '.join(multi_word[:3])}...")
     
-    print("\nSpecial tokens (first 3):")
-    for token in SPECIAL_TOKENS[:3]:
-        print(f"  • {token}")
-    print(f"  ... and {len(SPECIAL_TOKENS) - 3} more")
-    
-    # Check CUDA
     try:
         import torch
-        print("\nCUDA Status:")
+        print(f"\nCUDA Status:")
         if torch.cuda.is_available():
             print(f"  ✓ CUDA available")
             print(f"  ✓ Device: {torch.cuda.get_device_name(0)}")
             print(f"  ✓ Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         else:
-            print(f"  ✗ CUDA not available (will use CPU)")
+            print(f"  ✗ CUDA not available")
     except:
-        print("\n⚠️  Could not check CUDA status")
+        pass
     
     print("\n" + "=" * 70 + "\n")
 
