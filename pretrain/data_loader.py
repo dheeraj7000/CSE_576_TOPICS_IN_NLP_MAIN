@@ -10,7 +10,7 @@ The issue:
 - Result: torch.stack fails on lists
 
 Solution:
-- Check if input is list or tensor
+- Check if input is list or tensor.
 - Convert lists to tensors IN THE COLLATOR
 - Then proceed with stacking
 """
