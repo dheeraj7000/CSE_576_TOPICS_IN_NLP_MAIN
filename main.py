@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+<<<<<<< HEAD
 main_fixed_v5.py - REPAIR NULL VALUES (DON'T SKIP FILES!)
 
 FIXED APPROACH:
@@ -16,6 +17,18 @@ Key repairs:
 - Missing input_ids → generate zeros
 - Wrong types → force to correct type
 - Concatenation errors → fix before conversion
+=======
+main.py - UPDATED FOR model_multiword_support.py
+
+CRITICAL SIMPLIFICATION:
+- Model auto-detects connector tags from input_ids
+- NO TensorDatasetWrapper needed!
+- Simpler data pipeline
+- Works with or without connector_mask in parquet
+
+FLOW:
+parquet → input_ids + attention_mask → model detects tags → boost applied
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
 """
 
 import os
@@ -33,7 +46,144 @@ from tqdm import tqdm
 from utils.config import Config
 from pretrain.model import initialize_model
 from pretrain.trainer import ConnectorPretrainingManager
-from pretrain.data_loader import ConnectorDataCollatorWithMaskCreation
+
+from pathlib import Path
+import gc
+import pandas as pd
+import pyarrow.parquet as pq
+from datasets import concatenate_datasets
+def yield_parquet_dataset_chunks(parquet_path: str, chunk_size: int = 20, split_ratio: float = 0.05):
+    """
+    Yield HFDatasets built from at most `chunk_size` parquet files at a time.
+    Ensures:
+      • required columns present
+      • non-empty frames
+      • safe split (≥1 train sample)
+      • skips chunks that would produce train==0
+    """
+    p = Path(parquet_path)
+    parquet_files = sorted([p] if p.is_file() else p.glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found at {parquet_path}")
+
+    for start in range(0, len(parquet_files), chunk_size):
+        batch_files = parquet_files[start:start + chunk_size]
+
+        all_datasets = []
+        for file_path in batch_files:
+            try:
+                pa_cols = set(pq.ParquetFile(file_path).schema.names)
+            except Exception as e:
+                logger.warning(f"Skipping {file_path.name}: could not read schema ({e})")
+                continue
+
+            required = {"input_ids", "attention_mask"}
+            if not required.issubset(pa_cols):
+                logger.warning(f"Skipping {file_path.name}: missing columns {sorted(required - pa_cols)}; have {sorted(pa_cols)}")
+                continue
+
+            cols = [c for c in ("input_ids", "attention_mask", "connector_mask") if c in pa_cols]
+            df = pd.read_parquet(file_path, columns=cols)
+
+            if df.empty:
+                logger.warning(f"Skipping {file_path.name}: zero rows")
+                continue
+
+            def _ok(x):
+                return isinstance(x, (list, np.ndarray)) and len(x) > 0
+            df = df[df["input_ids"].map(_ok) & df["attention_mask"].map(_ok)]
+            if df.empty:
+                logger.warning(f"Skipping {file_path.name}: all rows invalid (empty sequences)")
+                continue
+
+            df = clean_dataframe_batch(df)
+            ds = df_to_hfdataset_batch(df)
+            all_datasets.append(ds)
+
+            del df, ds
+            gc.collect()
+
+        if not all_datasets:
+            logger.warning("No usable parquet files in this chunk; skipping chunk.")
+            continue
+
+        full_ds = all_datasets[0] if len(all_datasets) == 1 else concatenate_datasets(all_datasets)
+        n = len(full_ds)
+        if n == 0:
+            logger.warning("Chunk produced 0 samples; skipping chunk.")
+            continue
+
+        # Safe split that guarantees ≥1 train sample
+        if 0 < split_ratio < 1 and n >= 2:
+            test_n = max(1, int(round(n * split_ratio)))
+            test_n = min(test_n, n - 1)
+            split = full_ds.train_test_split(test_size=test_n, seed=42, shuffle=True)
+            dataset_dict = {'train': split['train'], 'validation': split['test']}
+        else:
+            dataset_dict = {'train': full_ds, 'validation': None}
+
+        if len(dataset_dict['train']) == 0:
+            logger.warning("After split, train=0; skipping chunk.")
+            continue
+
+        yield dataset_dict
+
+        del all_datasets, full_ds, dataset_dict
+        gc.collect()
+
+
+def train_in_chunks(config, model_handler, parquet_path: str, chunk_size: int = 20, split_ratio: float = 0.05):
+    """
+    Keep one Trainer and swap its dataset per chunk to preserve optimizer/LR state.
+    """
+    # Create manager and Trainer once (mirrors your run_training() flow):contentReference[oaicite:8]{index=8}
+    pretrain_manager = ConnectorPretrainingManager(
+        config=config,
+        model_handler=model_handler,
+        use_new_collator=True  # you already use this:contentReference[oaicite:9]{index=9}
+    )
+
+    chunk_iter = yield_parquet_dataset_chunks(parquet_path, chunk_size=chunk_size, split_ratio=split_ratio)
+    # Initialize Trainer on the first non-empty chunk
+    first = next(chunk_iter, None)
+    if first is None or len(first['train']) == 0:
+        raise RuntimeError(
+            "No non-empty training chunk was found. "
+            "Check PARQUET_PATH, required columns (input_ids, attention_mask), and that parquet files have rows."
+        )
+    pretrain_manager.prepare_trainer(
+        train_dataset=first['train'],
+        eval_dataset=first.get('validation'),
+        output_dir="./output/connector_model_stream",
+        boost_factor=config.boost_factor,
+        use_amplification=False,
+        amplification_strength=1.0,
+        num_epochs=1,
+        batch_size=1,
+        learning_rate=5e-6
+    )
+    trainer = pretrain_manager.trainer
+    trainer.train()
+
+    clear_cuda_memory()  # your helper: gc + cuda empty + reset peak stats:contentReference[oaicite:10]{index=10}
+
+    # Iterate remaining chunks
+    for dataset_dict in chunk_iter:
+        # Swap datasets; keep optimizer/scheduler
+        if dataset_dict is None or len(dataset_dict['train']) == 0:
+            logger.warning("Skipping a chunk with empty train split")
+            continue
+        trainer.train_dataset = dataset_dict['train']
+        trainer.eval_dataset = dataset_dict.get('validation', None)
+
+        # Force dataloader rebuild if cached by your HF version
+        if hasattr(trainer, "_reset_train_dataloader"):
+            trainer._reset_train_dataloader()
+
+        # Continue training; not resuming from checkpoint since we never stopped the process
+        trainer.train(resume_from_checkpoint=False)
+
+        clear_cuda_memory()
 
 # Setup logging
 logging.basicConfig(
@@ -84,6 +234,7 @@ def load_model_handler(config: Config):
     return model_handler
 
 
+<<<<<<< HEAD
 def convert_string_to_int(value):
     """Convert a single value from string to int if needed."""
     if isinstance(value, str):
@@ -139,11 +290,23 @@ def repair_row(row, column_config):
         row: Dictionary row from parquet
         column_config: Dict of column → expected_type
     
+=======
+def clean_dataframe_batch(df):
+    """
+    Clean a single batch DataFrame.
+    
+    Converts numpy arrays to lists for HFDataset compatibility.
+    
+    Args:
+        df: Pandas DataFrame
+        
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     Returns:
         Repaired row dictionary
     """
     repaired = {}
     
+<<<<<<< HEAD
     for col, expected_type in column_config.items():
         value = row.get(col)
         
@@ -186,6 +349,22 @@ def repair_row(row, column_config):
         else:
             # Fallback: keep as-is
             repaired[col] = value
+=======
+    # Process each column
+    for col in cleaned_df.columns:
+        if cleaned_df[col].dtype == object:
+            # Check if column contains numpy arrays
+            sample = cleaned_df[col].iloc[0] if len(cleaned_df) > 0 else None
+            if isinstance(sample, np.ndarray):
+                cleaned_df[col] = cleaned_df[col].apply(
+                    lambda x: x.tolist() if isinstance(x, np.ndarray) else x
+                )
+            # Handle null values in list columns
+            elif isinstance(sample, list):
+                cleaned_df[col] = cleaned_df[col].apply(
+                    lambda x: x if (isinstance(x, list) and x is not None) else []
+                )
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     
     return repaired
 
@@ -223,7 +402,16 @@ def repair_dataframe_batch(df, column_config):
 def df_to_hfdataset_batch(df):
     """
     Convert DataFrame to HFDataset.
+<<<<<<< HEAD
     After repair, this should succeed.
+=======
+    
+    Args:
+        df: Pandas DataFrame
+        
+    Returns:
+        HFDataset
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     """
     # Convert to dict format
     data_dict = {}
@@ -238,6 +426,7 @@ def df_to_hfdataset_batch(df):
         raise
 
 
+<<<<<<< HEAD
 class StringConvertingDataset:
     """
     FIXED: Extra safety - double-check all values are proper types.
@@ -304,6 +493,25 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
     logger.info("✓ REPAIRING NULL VALUES (not skipping)")
     logger.info("✓ Converting strings to integers")
     logger.info("✓ Preserving ALL samples")
+=======
+def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.05):
+    """
+    Load data from parquet files BATCH-WISE (memory efficient).
+    
+    SIMPLIFIED: No TensorDatasetWrapper needed!
+    Model auto-detects connector tags from input_ids.
+    
+    Args:
+        parquet_path: Path to parquet directory or file
+        split_ratio: Ratio for train/validation split
+    
+    Returns:
+        dataset_dict: Dictionary with 'train' and 'validation' HFDatasets
+    """
+    logger.info("\n" + "="*70)
+    logger.info("LOADING DATA FROM PARQUET (BATCH-WISE)")
+    logger.info("SIMPLIFIED: Model auto-detects connector tags")
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     logger.info("="*70)
     
     parquet_path = Path(parquet_path)
@@ -323,9 +531,12 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
         return None
     
     logger.info(f"Found {len(parquet_files)} parquet files")
-    logger.info("Processing files one at a time (batch-wise)...")
     
+<<<<<<< HEAD
     # Step 1: Validate and get column config
+=======
+    # Step 1: Validate required columns
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     logger.info("\n[1/3] Validating data structure...")
     
     try:
@@ -340,6 +551,7 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
             'connector_types': 'str_list',  # Optional
         }
         
+<<<<<<< HEAD
         # Add optional columns from first file
         for col in first_df.columns:
             if col not in column_config:
@@ -349,6 +561,25 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
         logger.info(f"  Required: input_ids (int_list), attention_mask (int_list)")
         logger.info(f"  Optional: connector_mask, connector_words, connector_types")
         logger.info(f"  Total columns: {len(column_config)}")
+=======
+        if not required_cols.issubset(actual_cols):
+            missing = required_cols - actual_cols
+            logger.error(f"❌ Missing required columns: {missing}")
+            logger.error(f"   Available: {actual_cols}")
+            return None
+        
+        logger.info(f"✓ Required columns present")
+        logger.info(f"  Columns in parquet: {list(actual_cols)}")
+        logger.info(f"  First file has {len(first_df):,} rows")
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
+        
+        # Check if connector_mask is present
+        has_connector_mask = 'connector_mask' in actual_cols
+        logger.info(f"  connector_mask present: {has_connector_mask}")
+        if has_connector_mask:
+            logger.info(f"    (Will be used for loss weighting)")
+        else:
+            logger.info(f"    (Model will auto-detect tags from input_ids)")
         
     except Exception as e:
         logger.error(f"❌ Error validating first file: {e}")
@@ -370,6 +601,7 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
             
             logger.debug(f"  File {file_idx}: {num_rows:,} rows")
             
+<<<<<<< HEAD
             # CRITICAL: REPAIR (don't skip!)
             try:
                 df_repaired = repair_dataframe_batch(df, column_config)
@@ -377,6 +609,10 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
             except Exception as e:
                 logger.warning(f"  File {file_idx}: Repair failed: {e}, using raw data")
                 df_repaired = df
+=======
+            # Clean file
+            df = clean_dataframe_batch(df)
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
             
             # Convert to HFDataset
             try:
@@ -389,7 +625,11 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
             all_datasets.append(dataset)
             
             # Memory cleanup
+<<<<<<< HEAD
             del df, df_repaired
+=======
+            del df
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
             gc.collect()
             
         except Exception as e:
@@ -432,11 +672,14 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
     
     if split_ratio > 0 and split_ratio < 1:
         split = full_dataset.train_test_split(test_size=split_ratio, seed=42)
-        train_dataset = split['train']
-        val_dataset = split['test']
-        logger.info(f"  - Train: {len(train_dataset):,} samples")
-        logger.info(f"  - Validation: {len(val_dataset):,} samples")
+        dataset_dict = {
+            'train': split['train'],
+            'validation': split['test']
+        }
+        logger.info(f"  - Train: {len(dataset_dict['train']):,} samples")
+        logger.info(f"  - Validation: {len(dataset_dict['validation']):,} samples")
     else:
+<<<<<<< HEAD
         train_dataset = full_dataset
         val_dataset = None
         logger.info(f"  - Using full dataset: {len(train_dataset):,} samples")
@@ -455,13 +698,34 @@ def load_data_from_parquet_batch_wise(parquet_path: str, split_ratio: float = 0.
     logger.info(f"  Original: 186,899 samples")
     logger.info(f"  After repair: {len(train_dataset) + (len(val_dataset) if val_dataset else 0):,} samples")
     logger.info(f"  ✓ NO DATA LOST (all NULL values fixed)!")
+=======
+        dataset_dict = {
+            'train': full_dataset,
+            'validation': None
+        }
+        logger.info(f"  - Using full dataset: {len(full_dataset):,} samples")
+    
+    logger.info("\n" + "="*70)
+    logger.info("✓ Data loaded successfully (NO WRAPPING NEEDED)")
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     logger.info("="*70)
     
     return dataset_dict
 
 
 def run_training(config, model_handler, dataset_dict):
+<<<<<<< HEAD
     """Run training with repaired data."""
+=======
+    """
+    Run training for 1 epoch and save the model.
+    
+    Args:
+        config: Configuration object
+        model_handler: Model instance
+        dataset_dict: Dictionary with 'train' and 'validation' datasets
+    """
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     logger.info("\n" + "="*70)
     logger.info("SETTING UP TRAINING")
     logger.info("="*70)
@@ -536,6 +800,7 @@ def save_model(pretrain_manager):
 
 
 def main():
+<<<<<<< HEAD
     """Main entry point with repair (not skip)."""
     
     logger.info("\n" + "="*70)
@@ -547,6 +812,21 @@ def main():
     logger.info("  • Fix type mismatches")
     logger.info("  • Preserve ALL samples")
     logger.info("  • STRING → INTEGER CONVERSION AT LOAD TIME")
+=======
+    """
+    Main entry point - Simplified training pipeline.
+    
+    UPDATED FOR model_multiword_support.py:
+    - Model auto-detects connector tags
+    - No TensorDatasetWrapper needed
+    - Simpler, cleaner code
+    """
+    
+    logger.info("\n" + "="*70)
+    logger.info("CONNECTOR-AWARE PRETRAINING PIPELINE")
+    logger.info("UPDATED: Model auto-detects connector tags")
+    logger.info("Training for 1 epoch")
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
     logger.info("="*70)
     
     try:
@@ -575,26 +855,23 @@ def main():
         
         parquet_path = os.environ.get('PARQUET_PATH', './data_splits')
         logger.info(f"Parquet path: {parquet_path}")
-        
-        dataset_dict = load_data_from_parquet_batch_wise(parquet_path, split_ratio=0.05)
-        
-        if dataset_dict is None or dataset_dict['train'] is None:
-            logger.error("\n❌ Failed to load data")
-            logger.info("\n💡 Make sure:")
-            logger.info("  • Parquet files exist at: ./data_splits")
-            logger.info("  • Or set: export PARQUET_PATH=/path/to/parquet")
-            logger.info("  • Parquet columns include: input_ids, attention_mask")
-            return
-        
-        # Train model
-        logger.info("\n[Step 4/5] Training model...")
-        pretrain_manager = run_training(config, model_handler, dataset_dict)
-        
-        # Save model
-        logger.info("\n[Step 5/5] Saving model...")
-        save_model(pretrain_manager)
-        
-        # Cleanup
+
+        # Toggle via env var; default to chunked training
+        use_chunked = os.environ.get("CHUNKED_TRAINING", "1") == "1"
+        chunk_size = int(os.environ.get("CHUNK_SIZE", "20"))
+
+        if use_chunked:
+            logger.info("Using CHUNKED training pipeline")
+            train_in_chunks(config, model_handler, parquet_path, chunk_size=chunk_size, split_ratio=0.05)
+        else:
+            # Fallback: your old all-in-memory path (not recommended for large corpora)
+            dataset_dict = load_data_from_parquet_batch_wise(parquet_path, split_ratio=0.05)  # current function:contentReference[oaicite:11]{index=11}
+            if dataset_dict is None or dataset_dict['train'] is None:
+                logger.error("\n❌ Failed to load data (non-chunked mode)")
+                return
+            pretrain_manager = run_training(config, model_handler, dataset_dict)  # current function:contentReference[oaicite:12]{index=12}
+            save_model(pretrain_manager)                                          # current function:contentReference[oaicite:13]{index=13}
+
         clear_cuda_memory()
         
         # Success message
@@ -603,13 +880,26 @@ def main():
         logger.info("="*70)
         logger.info("\n📊 Summary:")
         logger.info(f"  • Model: {config.model_name}")
-        logger.info(f"  • Training samples: {len(dataset_dict['train']):,}")
-        if dataset_dict.get('validation'):
-            logger.info(f"  • Validation samples: {len(dataset_dict['validation']):,}")
+        if use_chunked:
+            logger.info("  • Training samples: see per‑chunk logs")
+        else:
+            logger.info(f"  • Training samples: {len(dataset_dict['train']):,}")
+            if dataset_dict.get('validation'):
+                logger.info(f"  • Validation samples: {len(dataset_dict['validation']):,}")
         logger.info(f"  • Epochs: 1")
         logger.info(f"  • Batch size: 1")
+<<<<<<< HEAD
         logger.info(f"  • Data approach: REPAIR (preserve all samples)")
         logger.info(f"  • Output: ./output/connector_model_1epoch/final")
+=======
+        logger.info(f"\n✓ Key Features:")
+        logger.info(f"  • Auto connector tag detection")
+        logger.info(f"  • Multi-word connector support")
+        logger.info(f"  • Boost applied at embedding layer")
+        logger.info(f"  • Gradient amplification: 1.1× (not 1.1^28)")
+        logger.info(f"  • No TensorDatasetWrapper needed")
+        logger.info(f"\n  • Output: ./output/connector_model_1epoch/final")
+>>>>>>> dc7d560e7d30bf978fc5115a3ad091aa6984a6ae
         logger.info("\n🎉 Done!")
         
     except torch.cuda.OutOfMemoryError:
