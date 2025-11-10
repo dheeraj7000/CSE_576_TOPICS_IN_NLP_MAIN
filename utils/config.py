@@ -54,31 +54,31 @@ class Config:
     
     # ========== CONNECTOR TYPES (COMPLETE) ==========
     connector_types: Dict[str, List[str]] = field(default_factory=lambda: {
-        'causal': [
+        'CAUSAL': [
             'because', 'since', 'as', 'for', 'therefore', 'thus',
             'hence', 'consequently', 'accordingly', 'as a result',
             'due to', 'owing to', 'so that', 'in order to'
         ],
-        'adversative': [
+        'ADVERSATIVE': [
             'but', 'however', 'yet', 'whereas', 'while', 'although',
             'though', 'despite', 'in spite of', 'nevertheless',
             'nonetheless', 'on the other hand', 'in contrast'
         ],
-        'temporal': [
+        'TEMPORAL': [
             'when', 'while', 'as', 'whenever', 'before', 'after',
             'meanwhile', 'then', 'first', 'second', 'finally',
             'eventually', 'ultimately', 'during', 'throughout'
         ],
-        'conditional': [
+        'CONDITIONAL': [
             'if', 'when', 'whenever', 'once', 'assuming',
             'provided that', 'given that', 'in case', 'unless'
         ],
-        'conclusive': [
+        'CONCLUSIVE': [
             'therefore', 'thus', 'hence', 'so', 'in conclusion',
             'to conclude', 'in summary', 'to summarize', 'in short',
             'overall', 'in general', 'finally', 'ultimately'
         ],
-        'additive': [
+        'ADDITIVE': [
             'and', 'also', 'too', 'moreover', 'furthermore',
             'in addition', 'besides', 'likewise', 'similarly',
             'for example', 'for instance', 'such as', 'particularly'

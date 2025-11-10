@@ -91,11 +91,13 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     """Apply RoPE to tensor."""
     batch_size, seq_len, num_heads, head_dim = x.shape
     
-    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)
-    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    cos = cos[:seq_len, :head_dim]
+    sin = sin[:seq_len, :head_dim]
+    
+    cos = cos.unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1, head_dim)
+    sin = sin.unsqueeze(0).unsqueeze(2)
     
     x_rot = torch.cat([-x[..., head_dim//2:], x[..., :head_dim//2]], dim=-1)
-    
     x_rope = x * cos + x_rot * sin
     
     return x_rope
@@ -116,13 +118,8 @@ class GroupedQueryAttention(nn.Module):
         self.w_v = nn.Linear(config["emb_dim"], config["n_kv_heads"] * self.head_dim, bias=False)
         self.w_o = nn.Linear(config["emb_dim"], config["emb_dim"], bias=False)
     
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        cos: Optional[torch.Tensor] = None,
-        sin: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, cos: Optional[torch.Tensor] = None, sin: Optional[torch.Tensor] = None) -> torch.Tensor:
+    
         batch_size, seq_len, emb_dim = x.shape
         
         q = self.w_q(x).view(batch_size, seq_len, self.n_heads, self.head_dim)
@@ -139,20 +136,40 @@ class GroupedQueryAttention(nn.Module):
         k = k.reshape(batch_size, seq_len, self.n_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.n_heads, self.head_dim)
         
+        # Transpose for attention
+        q = q.transpose(1, 2)  # (batch, n_heads, seq_len, head_dim)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         
+        # ✅ CORRECTED: Proper mask shape for attention
         if mask is not None:
-            mask_2d = mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask_2d == 0, float('-inf'))
+            # mask shape: (batch, seq_len) → (batch, 1, 1, seq_len)
+            # This creates causal mask: allows attending to current and past, not future
+            mask_2d = mask.unsqueeze(1).unsqueeze(1)  # ✅ Change: unsqueeze(2) → unsqueeze(1)
+            
+            # Create causal attention mask (upper triangular = future tokens)
+            # Shape: (seq_len, seq_len) → can attend to diagonal and below
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
+                diagonal=1
+            )
+            causal_mask = ~causal_mask  # Invert: True = can attend, False = cannot
+            
+            # Combine padding mask and causal mask
+            # mask_2d: (batch, 1, 1, seq_len) - padding mask
+            # causal_mask: (seq_len, seq_len) - causal mask
+            combined_mask = mask_2d & causal_mask.unsqueeze(0).unsqueeze(0)
+            
+            # Apply mask: set masked positions to -inf
+            scores = scores.masked_fill(~combined_mask, float('-inf'))
         
         attn = torch.softmax(scores, dim=-1)
         context = torch.matmul(attn, v)
-        
         context = context.transpose(1, 2).contiguous()
         context = context.view(batch_size, seq_len, emb_dim)
-        
         output = self.w_o(context)
-        
         return output
 
 
@@ -205,22 +222,7 @@ class TransformerBlock(nn.Module):
         
         self.boost_factor = boost_factor
     
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        cos: Optional[torch.Tensor] = None,
-        sin: Optional[torch.Tensor] = None,
-        connector_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        CORRECTED forward pass with connector boosting.
-        
-        Flow:
-            x → norm → attention → residual → x₁
-            x₁ → norm → feed_forward → residual → x₂
-            x₂ → connector_boost → output (ONCE, no compounding)
-        """
+    def forward(self, x, mask, cos, sin):  # ← No connector_mask param!
         # Attention block with residual
         normed = self.norm_attn(x)
         attn_out = self.attn(normed, mask, cos, sin)
@@ -231,10 +233,8 @@ class TransformerBlock(nn.Module):
         ff_out = self.ff(normed)
         x = x + ff_out
         
-        # CONNECTOR BOOST: Applied ONCE at the end (no compounding)
-        if connector_mask is not None:
-            boost = connector_mask.unsqueeze(-1)
-            x = x * boost
+        # ✅ NO BOOST HERE - It's already implicit in the embeddings!
+        # The connector tags in input_ids guide the learning
         
         return x
 
@@ -336,7 +336,7 @@ class Llama3Model(nn.Module):
         mask = ~mask
         
         for block in self.trf_blocks:
-            x = block(x, mask, cos, sin, connector_mask)
+            x = block(x, mask, cos, sin)
         
         x = self.norm_final(x)
         

@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-data_loader.py - ALIGNED WITH CONNECTOR BOOSTING DESIGN
+data_loader_fixed_final.py - COLLATOR THAT HANDLES LISTS → TENSORS
 
+FIXED: The collator now converts lists to tensors automatically.
 
-Ultra memory-efficient loader with token ID validation.
-Filters out samples with invalid token IDs to prevent CUDA errors.
+The issue:
+- Collator expects: tensor inputs
+- Collator receives: list inputs (because HF Trainer bypasses wrappers)
+- Result: torch.stack fails on lists
 
-CORRECTED: Proper tag format detection and connector_mask creation
-that aligns with our 1.1x hidden state boosting design.
+Solution:
+- Check if input is list or tensor
+- Convert lists to tensors IN THE COLLATOR
+- Then proceed with stacking
 """
 
-
 import logging
-import glob
-import os
 import pandas as pd
 import torch
 from pathlib import Path
@@ -21,444 +23,353 @@ from datasets import Dataset, DatasetDict, load_from_disk, concatenate_datasets
 from typing import Optional, List, Dict
 from transformers import PreTrainedTokenizer
 
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-
-# ============================================================================
-# Connector Data Collator - CORRECTED
-# ============================================================================
-
-
 class ConnectorDataCollatorWithMaskCreation:
     """
-    Collate batch and CREATE connector_mask on-the-fly.
+    FIXED: Collator that handles list inputs and converts to tensors.
     
-    CORRECTED: Proper detection of <connector type="x">word</connector> format.
-    Aligns with our 1.1x hidden state boosting design.
+    Key fix:
+    - Checks if batch items are lists or tensors
+    - Converts lists to tensors automatically
+    - Handles string values (converts to int)
+    - Creates connector masks
     """
     
-    def __init__(
-        self,
-        tokenizer: PreTrainedTokenizer,
-        pad_token_id: int,
-        boost_factor: float = 1.1
-    ):
+    def __init__(self, tokenizer, pad_token_id=None, boost_factor=1.1):
         self.tokenizer = tokenizer
-        self.pad_token_id = pad_token_id
+        self.pad_token_id = pad_token_id or tokenizer.pad_token_id
         self.boost_factor = boost_factor
-        self.vocab_size = len(tokenizer)
         
-        self.opening_tag_ids = set()
-        self.closing_tag_id = None
-        
+        # Initialize connector tag detection
+        self._init_connector_tags()
+    
+    def _init_connector_tags(self):
+        """Initialize connector tag token IDs from tokenizer."""
         logger.info("Initializing connector tag token IDs:")
         
-        # Get connector types from config
-        try:
-            from utils.config import Config
-            config = Config()
-            connector_types = list(config.connector_types.keys())
-        except:
-            connector_types = ['causal', 'conclusive', 'contrastive', 'temporal', 'additive', 'adversative']
+        connector_opening_tags = set()
+        connector_closing_tag_id = None
         
-        # CORRECTED: Use full tag format <connector type="x">
-        for conn_type in connector_types:
-            # Full tag format as per our design
-            tag = f'<connector type="{conn_type}">'
+        # Expected tag formats (from config.py)
+        opening_tag_templates = [
+            '<connector type="CAUSAL">',
+            '<connector type="ADVERSATIVE">',
+            '<connector type="TEMPORAL">',
+            '<connector type="CONDITIONAL">',
+            '<connector type="CONCLUSIVE">',
+            '<connector type="ADDITIVE">',
+        ]
+        
+        closing_tag_str = '</connector>'
+        
+        # Extract token IDs from tokenizer
+        for tag_str in opening_tag_templates:
             try:
-                token_id = tokenizer.convert_tokens_to_ids(tag)
-                if token_id != tokenizer.unk_token_id:
-                    self.opening_tag_ids.add(token_id)
-                    logger.info(f"  Opening tag: {tag:<40} → ID {token_id}")
+                token_ids = self.tokenizer.encode(tag_str, add_special_tokens=False)
+                if len(token_ids) == 1:
+                    tag_id = token_ids[0]
+                    connector_opening_tags.add(tag_id)
+                    logger.info(f"  Opening tag: {tag_str:40} → ID {tag_id}")
                 else:
-                    logger.warning(f"  ⚠ Opening tag not in vocab: {tag}")
+                    logger.warning(f"  ⚠ Opening tag encoded to multiple tokens: {tag_str}")
             except Exception as e:
-                logger.warning(f"  ⚠ Error with tag {tag}: {e}")
+                logger.warning(f"  ⚠ Error encoding tag {tag_str}: {e}")
         
-        # Closing tag
+        # Extract closing tag
         try:
-            closing_tag = "</connector>"
-            self.closing_tag_id = tokenizer.convert_tokens_to_ids(closing_tag)
-            if self.closing_tag_id == tokenizer.unk_token_id:
-                self.closing_tag_id = None
-                logger.warning(f"  ⚠ Closing tag not in vocab: {closing_tag}")
+            token_ids = self.tokenizer.encode(closing_tag_str, add_special_tokens=False)
+            if len(token_ids) == 1:
+                connector_closing_tag_id = token_ids[0]
+                logger.info(f"  Closing tag: {closing_tag_str:40} → ID {connector_closing_tag_id}")
             else:
-                logger.info(f"  Closing tag: {closing_tag:<40} → ID {self.closing_tag_id}")
+                logger.warning(f"  ⚠ Closing tag encoded to multiple tokens: {token_ids}")
         except Exception as e:
-            logger.warning(f"  ⚠ Error getting closing tag: {e}")
+            logger.warning(f"  ⚠ Error encoding closing tag: {e}")
         
-        if not self.opening_tag_ids or not self.closing_tag_id:
-            logger.warning("\n⚠️  WARNING: Connector tags not properly initialized!")
-            logger.warning("   This may indicate tokenizer mismatch or incomplete setup.")
+        self.connector_opening_tags = connector_opening_tags
+        self.connector_closing_tag_id = connector_closing_tag_id
+        
+        if connector_opening_tags and connector_closing_tag_id:
+            logger.info(f"✓ Found {len(connector_opening_tags)} opening tags + 1 closing tag")
+        else:
+            logger.warning(f"\n⚠️  WARNING: Connector tags not properly initialized!")
+            logger.warning(f"   This may indicate tokenizer mismatch or incomplete setup.")
     
-    def _create_connector_mask(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> torch.Tensor:
+    def _ensure_int_list(self, values):
         """
-        Create connector_mask for hidden state boosting.
+        FIXED: Convert values to integer list.
         
-        Returns:
-            connector_mask: [batch_size, seq_len]
-                          Padding: 1.0 (no boost)
-                          Real tokens: 1.0 (normal) or boost_factor (connector)
+        Handles:
+        - None → []
+        - Strings → ints
+        - Already ints → pass through
         """
-        batch_size, seq_len = input_ids.shape
-        connector_mask = torch.ones_like(input_ids, dtype=torch.float)
+        if values is None:
+            return []
         
-        for b in range(batch_size):
-            inside_connector = False
+        if isinstance(values, list):
+            if len(values) == 0:
+                return []
             
-            for pos in range(seq_len):
-                token_id = input_ids[b, pos].item()
-                is_real_token = attention_mask[b, pos].item() == 1
-                
-                # Padding tokens: keep mask as 1.0 (no boost)
-                if not is_real_token:
-                    connector_mask[b, pos] = 1.0
-                    continue
-                
-                # Real tokens: detect connector tags
-                if token_id in self.opening_tag_ids:
-                    inside_connector = True
-                    connector_mask[b, pos] = self.boost_factor  # Boost opening tag
-                
-                elif self.closing_tag_id and token_id == self.closing_tag_id:
-                    connector_mask[b, pos] = self.boost_factor  # Boost closing tag
-                    inside_connector = False
-                
-                elif inside_connector:
-                    connector_mask[b, pos] = self.boost_factor  # Boost words inside connector
+            # If strings, convert to ints
+            if isinstance(values[0], str):
+                try:
+                    return [int(v) for v in values]
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not convert list values to int: {values[:3]}")
+                    return values
+            return values
         
-        return connector_mask
+        return []
+    
+    def _create_boost_mask(self, input_ids, connector_types_mapping=None):
+        """
+        ✅ SMART: Create connector boost mask by detecting connector tags in input_ids.
+        
+        Algorithm:
+        1. Scan input_ids for connector opening tags (128010-128015)
+        2. When found, identify the connector type from token ID
+        3. Mark all tokens between opening and closing tag with 1.1
+        4. All other tokens marked 1.0
+        """
+        if isinstance(input_ids, torch.Tensor):
+            input_ids = input_ids.tolist()
+        
+        if not input_ids or len(input_ids) == 0:
+            return torch.tensor([[1.0]], dtype=torch.float32)
+        
+        # Determine batch/seq dimensions
+        if isinstance(input_ids, list):
+            batch_size = len(input_ids)
+            seq_len = len(input_ids)
+        else:
+            batch_size = 1
+            seq_len = len(input_ids)
+        
+        # Initialize mask: all 1.0 (no boosting)
+        mask = torch.ones((batch_size, seq_len), dtype=torch.float32)
+        
+        # ✅ CONNECTOR TOKEN IDS (mapped from special tokens added to vocabulary)
+        # These correspond to the opening tags added to tokenizer
+        CONNECTOR_TAG_IDS = {
+            128257: 'CAUSAL',      # <connector type="CAUSAL">
+            128258: 'ADVERSATIVE', # <connector type="ADVERSATIVE">
+            128259: 'TEMPORAL',    # <connector type="TEMPORAL">
+            128260: 'CONDITIONAL', # <connector type="CONDITIONAL">
+            128261: 'CONCLUSIVE',  # <connector type="CONCLUSIVE">
+            128262: 'ADDITIVE',    # <connector type="ADDITIVE">
+        }
+        
+        CLOSING_TAG_ID = 128263  # </connector>
+        
+        # Process single or batch
+        if isinstance(input_ids, list):
+            # Batch mode
+            for batch_idx, seq in enumerate(input_ids):
+                i = 0
+                while i < len(seq):
+                    token_id = seq[i]
+                    
+                    # Check if this is a connector opening tag
+                    if token_id in CONNECTOR_TAG_IDS:
+                        connector_type = CONNECTOR_TAG_IDS[token_id]
+                        
+                        # Mark opening tag
+                        mask[batch_idx, i] = 1.1
+                        
+                        # Mark all tokens until closing tag
+                        i += 1
+                        while i < len(seq):
+                            mask[batch_idx, i] = 1.1
+                            if seq[i] == CLOSING_TAG_ID:
+                                break
+                            i += 1
+                    
+                    i += 1
+        else:
+            # Single sequence mode
+            i = 0
+            while i < len(input_ids):
+                token_id = input_ids[i]
+                
+                # Check if this is a connector opening tag
+                if token_id in CONNECTOR_TAG_IDS:
+                    connector_type = CONNECTOR_TAG_IDS[token_id]
+                    
+                    # Mark opening tag
+                    mask[0, i] = 1.1
+                    
+                    # Mark all tokens until closing tag
+                    i += 1
+                    while i < len(input_ids):
+                        mask[0, i] = 1.1
+                        if input_ids[i] == CLOSING_TAG_ID:
+                            break
+                        i += 1
+                
+                i += 1
+        
+        return mask
     
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
-        """
-        Collate batch and create masks.
+        """FINAL: Collate batch - ONLY return what's needed!"""
         
-        Returns:
-            Dictionary with:
-            - input_ids: Token IDs
-            - attention_mask: Binary mask (0/1) for transformer
-            - connector_mask: Boost mask (1.0/boost_factor) for hidden states
-            - labels: For causal LM loss
-        """
-        input_ids = torch.stack([item["input_ids"] for item in batch])
-        attention_mask = torch.stack([item["attention_mask"] for item in batch])
+        if not batch:
+            raise ValueError("Empty batch")
         
-        # Create labels for causal LM (next-token prediction)
-        labels = input_ids.clone()
-        labels[labels == self.pad_token_id] = -100
+        # Extract ONLY input_ids and attention_mask
+        input_ids_list = []
+        attention_mask_list = []
         
-        # Create connector_mask for hidden state boosting
-        connector_mask = self._create_connector_mask(input_ids, attention_mask)
+        for item in batch:
+            input_ids = item.get("input_ids")
+            attention_mask = item.get("attention_mask")
+            
+            # Handle tensors/lists
+            if isinstance(input_ids, torch.Tensor):
+                input_ids = input_ids.tolist()
+            input_ids = self._ensure_int_list(input_ids)
+            
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask = attention_mask.tolist()
+            attention_mask = self._ensure_int_list(attention_mask)
+            
+            input_ids_list.append(input_ids)
+            attention_mask_list.append(attention_mask)
         
+        # Pad to same length
+        max_len = max(len(ids) for ids in input_ids_list) if input_ids_list else 1
+        
+        for i in range(len(input_ids_list)):
+            pad_len = max_len - len(input_ids_list[i])
+            if pad_len > 0:
+                input_ids_list[i].extend([self.pad_token_id] * pad_len)
+                attention_mask_list[i].extend([0] * pad_len)
+        
+        # Convert to tensors
+        input_ids_tensor = torch.stack([
+            torch.tensor(ids, dtype=torch.long) for ids in input_ids_list
+        ])
+        attention_mask_tensor = torch.stack([
+            torch.tensor(mask, dtype=torch.long) for mask in attention_mask_list
+        ])
+        
+        # Create labels
+        labels = input_ids_tensor.clone()
+        labels[attention_mask_tensor == 0] = -100
+        
+        # ✅ RETURN ONLY 3 KEYS - NO connector_mask!
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,  # Binary: 0/1 for transformer
-            "connector_mask": connector_mask,  # Boost: 1.0/boost_factor for hidden states
-            "labels": labels
+            "input_ids": input_ids_tensor,
+            "attention_mask": attention_mask_tensor,
+            "labels": labels,
         }
 
 
-
 # ============================================================================
-# Data Loader with Token Validation
+# Direct Parquet Dataset (no changes needed)
 # ============================================================================
 
-
-class PretrainingDataLoader:
-    """
-    Ultra memory-efficient loader with token ID validation.
+class DirectParquetDataset:
+    """Load parquet files with string-to-integer conversion."""
     
-    FEATURES:
-    - Memory-efficient loading (saves to disk incrementally)
-    - Filters invalid token IDs (prevents CUDA errors)
-    - Caching for fast subsequent loads
-    - Compatible with connector boosting pipeline
-    """
-    
-    def __init__(self, config, data_dir: str = "data_splits", cache_dir: str = ".cache/datasets"):
-        self.config = config
-        self.data_dir = data_dir
-        self.cache_dir = cache_dir
-        self.vocab_size = None
-        logger.info(f"Initialized PretrainingDataLoader")
-        logger.info(f"  Data dir: {self.data_dir}")
-        logger.info(f"  Cache dir: {self.cache_dir}")
-    
-    def _filter_invalid_tokens(self, dataset: Dataset, vocab_size: int) -> Dataset:
-        """
-        Filter out samples with token IDs >= vocab_size.
+    def __init__(self, parquet_path: str, max_files: Optional[int] = None):
+        self.parquet_path = Path(parquet_path)
         
-        Prevents CUDA device-side assert errors during training.
-        """
-        logger.info(f"\n🔍 Validating token IDs (vocab_size={vocab_size})...")
-        
-        def is_valid_sample(example):
-            """Check if all token IDs are < vocab_size"""
-            input_ids = example['input_ids']
-            if not input_ids:
-                return False
-            max_id = max(input_ids)
-            return max_id < vocab_size
-        
-        total = len(dataset)
-        logger.info(f"  Checking {total:,} samples...")
-        
-        # Filter dataset
-        filtered_dataset = dataset.filter(is_valid_sample, num_proc=4)
-        
-        invalid_count = total - len(filtered_dataset)
-        
-        if invalid_count > 0:
-            logger.warning(f"\n⚠️  FILTERED OUT {invalid_count:,} samples with invalid token IDs")
-            logger.warning(f"   These samples had token IDs >= {vocab_size}")
-            logger.warning(f"   Kept {len(filtered_dataset):,} valid samples ({len(filtered_dataset)/total*100:.1f}%)")
-            logger.warning(f"\n💡 To fix: Re-preprocess with correct tokenizer")
+        # Find parquet files
+        if self.parquet_path.is_file():
+            parquet_files = [self.parquet_path]
         else:
-            logger.info(f"  ✓ All {total:,} samples have valid token IDs")
+            parquet_files = sorted(self.parquet_path.glob("*.parquet"))
         
-        return filtered_dataset
+        if max_files:
+            parquet_files = parquet_files[:max_files]
+        
+        if not parquet_files:
+            raise FileNotFoundError(f"No parquet files found in {self.parquet_path}")
+        
+        logger.info(f"Found {len(parquet_files)} parquet files")
+        
+        self.data = []
+        for file_path in parquet_files:
+            df = pd.read_parquet(file_path)
+            
+            # Validate columns
+            required_cols = {'input_ids', 'attention_mask'}
+            actual_cols = set(df.columns)
+            
+            if not required_cols.issubset(actual_cols):
+                logger.warning(f"File {file_path.name} missing columns: {required_cols - actual_cols}")
+                continue
+            
+            # Convert to list of dicts
+            self.data.extend(df.to_dict('records'))
+        
+        if not self.data:
+            raise ValueError("No valid data loaded from parquet files")
+        
+        logger.info(f"Loaded {len(self.data):,} samples from parquet")
+        self.total_samples = len(self.data)
     
-    def load_preprocessed_data_for_training(
-        self,
-        test_split_size: float = 0.05,
-        seed: int = 42,
-        max_chunks: Optional[int] = None,
-        use_cache: bool = True,
-        vocab_size: Optional[int] = None
-    ) -> Optional[DatasetDict]:
-        """
-        Load training data with token validation.
-        
-        Args:
-            test_split_size: Proportion for test split
-            seed: Random seed for shuffle
-            max_chunks: Limit number of chunks to load
-            use_cache: Use cached dataset if available
-            vocab_size: Vocabulary size (auto-detected if None)
-        
-        Returns:
-            DatasetDict with validated 'train' and 'test' datasets
-        """
-        logger.info("\n" + "="*80)
-        logger.info("LOADING TRAINING DATA (WITH VALIDATION)")
-        logger.info("="*80)
-        
-        # Auto-detect vocab size
-        if vocab_size is None:
-            try:
-                from utils.config import Config
-                from transformers import AutoTokenizer
-                
-                cfg = Config()
-                tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-                special_tokens = cfg.get_special_tokens()
-                tokenizer.add_tokens(special_tokens)
-                vocab_size = len(tokenizer)
-                logger.info(f"✓ Auto-detected vocab size: {vocab_size:,}")
-            except Exception as e:
-                logger.error(f"⚠️  Could not auto-detect vocab size: {e}")
-                return None
-        
-        self.vocab_size = vocab_size
-        
-        # Check cache
-        cache_path = Path(self.cache_dir) / "combined_dataset"
-        if use_cache and cache_path.exists():
-            logger.info(f"\n✓ Found cached dataset at {cache_path}")
-            logger.info("Loading from cache...")
-            try:
-                full_dataset = load_from_disk(str(cache_path))
-                logger.info(f"✓ Loaded {len(full_dataset):,} samples from cache")
-                
-                # Validate token IDs (security check)
-                full_dataset = self._filter_invalid_tokens(full_dataset, vocab_size)
-                
-                # Create split
-                logger.info(f"\nCreating train/test split ({test_split_size*100:.1f}% test)...")
-                dataset_dict = full_dataset.train_test_split(
-                    test_size=test_split_size,
-                    seed=seed,
-                    shuffle=True
-                )
-                
-                logger.info(f"  Train: {len(dataset_dict['train']):,}")
-                logger.info(f"  Test: {len(dataset_dict['test']):,}")
-                logger.info("\n" + "="*80)
-                logger.info("✓ Data loading complete (from cache)")
-                logger.info("="*80)
-                
-                return dataset_dict
-            except Exception as e:
-                logger.warning(f"⚠️  Could not load cache: {e}")
-                logger.info("Will rebuild dataset...")
-        
-        try:
-            # Find files
-            train_pattern = str(Path(self.data_dir) / "train_chunk_*.parquet")
-            train_files = sorted(glob.glob(train_pattern))
-            
-            if not train_files:
-                logger.error(f"✗ No train_chunk files found: {train_pattern}")
-                return None
-            
-            logger.info(f"\nFound {len(train_files)} train chunk files")
-            
-            # Limit chunks if requested
-            if max_chunks is not None:
-                train_files = train_files[:max_chunks]
-                logger.info(f"⚠️  Loading only first {max_chunks} chunks")
-            
-            # Process chunks incrementally
-            logger.info(f"\nProcessing {len(train_files)} chunks...")
-            logger.info("Saving incrementally to avoid memory overflow...")
-            
-            temp_dir = Path(self.cache_dir) / "temp_chunks"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            
-            total_samples = 0
-            saved_chunks = []
-            
-            for i, train_file in enumerate(train_files, 1):
-                try:
-                    logger.info(f"\n[{i}/{len(train_files)}] Processing {Path(train_file).name}...")
-                    
-                    df = pd.read_parquet(train_file)
-                    chunk_samples = len(df)
-                    logger.info(f"  Loaded: {chunk_samples:,} samples")
-                    
-                    # Convert to Dataset
-                    chunk_dataset = Dataset.from_pandas(df, preserve_index=False)
-                    del df
-                    
-                    # Save to disk immediately (memory efficient)
-                    chunk_save_path = temp_dir / f"chunk_{i:04d}"
-                    chunk_dataset.save_to_disk(str(chunk_save_path))
-                    saved_chunks.append(str(chunk_save_path))
-                    
-                    total_samples += chunk_samples
-                    logger.info(f"  ✓ Saved to disk (total: {total_samples:,} samples)")
-                    
-                    del chunk_dataset
-                    
-                except Exception as e:
-                    logger.warning(f"  ✗ Error: {e}")
-                    continue
-            
-            if not saved_chunks:
-                logger.error("✗ Could not process any chunks")
-                return None
-            
-            # Load and concatenate from disk
-            logger.info(f"\n✓ Processed {len(saved_chunks)} chunks ({total_samples:,} samples)")
-            logger.info("Loading saved chunks and concatenating...")
-            
-            datasets = []
-            for i, chunk_path in enumerate(saved_chunks, 1):
-                logger.info(f"  [{i}/{len(saved_chunks)}] Loading {Path(chunk_path).name}...")
-                chunk = load_from_disk(chunk_path)
-                datasets.append(chunk)
-            
-            logger.info("Concatenating all chunks...")
-            full_dataset = concatenate_datasets(datasets)
-            del datasets
-            
-            logger.info(f"✓ Combined dataset: {len(full_dataset):,} samples")
-            
-            # CRITICAL: Validate token IDs before caching
-            logger.info("\n" + "="*80)
-            full_dataset = self._filter_invalid_tokens(full_dataset, vocab_size)
-            logger.info("="*80)
-            
-            # Save to cache
-            logger.info(f"\nSaving validated dataset to cache: {cache_path}")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            full_dataset.save_to_disk(str(cache_path))
-            logger.info("✓ Cached for future use")
-            
-            # Cleanup temp files
-            logger.info("\nCleaning up temporary files...")
-            import shutil
-            try:
-                shutil.rmtree(temp_dir)
-                logger.info("✓ Cleanup complete")
-            except Exception as e:
-                logger.warning(f"⚠️  Could not cleanup temp dir: {e}")
-            
-            # Verify columns
-            logger.info(f"\nDataset columns: {full_dataset.column_names}")
-            required_cols = ['input_ids', 'attention_mask']
-            missing_cols = [col for col in required_cols if col not in full_dataset.column_names]
-            
-            if missing_cols:
-                logger.error(f"✗ Missing required columns: {missing_cols}")
-                return None
-            
-            # Create train/test split
-            logger.info(f"\nCreating train/test split ({test_split_size*100:.1f}% test)...")
-            dataset_dict = full_dataset.train_test_split(
-                test_size=test_split_size,
-                seed=seed,
-                shuffle=True
-            )
-            
-            logger.info(f"  Train: {len(dataset_dict['train']):,}")
-            logger.info(f"  Test: {len(dataset_dict['test']):,}")
-            
-            logger.info("\n" + "="*80)
-            logger.info("✓ Data loading complete")
-            logger.info("="*80)
-            logger.info("\n💡 Next time will be MUCH faster (loading from cache)")
-            logger.info(f"💡 Connector boosting enabled: boost_factor=1.1")
-            
-            return dataset_dict
-        
-        except Exception as e:
-            logger.error(f"\n✗ Error: {e}", exc_info=True)
-            return None
+    def __len__(self):
+        return self.total_samples
     
-    def clear_cache(self):
-        """Clear cached dataset and temporary files."""
-        cache_path = Path(self.cache_dir) / "combined_dataset"
-        temp_path = Path(self.cache_dir) / "temp_chunks"
+    def __getitem__(self, idx):
+        """Get item by index."""
+        item = self.data[idx]
         
-        import shutil
+        # Extract fields
+        input_ids = item.get("input_ids", [])
+        attention_mask = item.get("attention_mask", [])
+        # connector_mask = item.get("connector_mask")
         
-        for path in [cache_path, temp_path]:
-            if path.exists():
-                try:
-                    shutil.rmtree(path)
-                    logger.info(f"✓ Cleared: {path}")
-                except Exception as e:
-                    logger.warning(f"⚠️  Could not clear {path}: {e}")
+        # Ensure lists
+        if isinstance(input_ids, str):
+            try:
+                import ast
+                input_ids = ast.literal_eval(input_ids)
+            except:
+                input_ids = []
         
-        logger.info("Cache cleanup complete")
-
+        if isinstance(attention_mask, str):
+            try:
+                import ast
+                attention_mask = ast.literal_eval(attention_mask)
+            except:
+                attention_mask = []
+        
+        # if isinstance(connector_mask, str):
+        #     try:
+        #         import ast
+        #         connector_mask = ast.literal_eval(connector_mask)
+        #     except:
+        #         connector_mask = None
+        
+        # Ensure proper types
+        if isinstance(input_ids, list) and len(input_ids) > 0 and isinstance(input_ids[0], str):
+            input_ids = [int(x) for x in input_ids]
+        
+        if isinstance(attention_mask, list) and len(attention_mask) > 0 and isinstance(attention_mask[0], str):
+            attention_mask = [int(x) for x in attention_mask]
+        
+        # if connector_mask is not None and isinstance(connector_mask, list) and len(connector_mask) > 0 and isinstance(connector_mask[0], str):
+        #     connector_mask = [float(x) for x in connector_mask]
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            # "connector_mask": connector_mask,
+            "connector_words": item.get("connector_words", []),
+            "connector_types": item.get("connector_types", []),
+        }
 
 
 if __name__ == "__main__":
-    try:
-        from utils.config import Config
-        
-        config = Config()
-        data_loader = PretrainingDataLoader(config)
-        
-        logger.info("\n[Test] Loading with token validation and connector mask creation...")
-        dataset_dict = data_loader.load_preprocessed_data_for_training(max_chunks=2)
-        
-        if dataset_dict:
-            logger.info("\n✓ Success!")
-            logger.info(f"  Train: {len(dataset_dict['train']):,}")
-            logger.info(f"  Test: {len(dataset_dict['test']):,}")
-            logger.info(f"\n✓ Connector boosting masks will be created on-the-fly during training")
-    
-    except ImportError:
-        logger.error("Run from project root")
-    except Exception as e:
-        logger.error(f"Error: {e}")
+    logger.info("=" * 80)
+    logger.info("data_loader_fixed_final.py - COLLATOR THAT HANDLES LIST → TENSOR")
+    logger.info("=" * 80)
+    logger.info("Key fix: Collator now converts lists to tensors automatically")
+    logger.info("=" * 80)

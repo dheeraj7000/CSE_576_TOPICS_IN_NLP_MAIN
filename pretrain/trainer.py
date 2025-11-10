@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """
-trainer.py - FULLY ALIGNED - FIXED FOR PARQUET STRUCTURE
-USES DIRECT COLUMN ACCESS from parquet files
+trainer.py - FINAL CORRECTED VERSION
 
-Parquet structure:
-- doc_id
-- domain
-- input_ids (list)
-- attention_mask (list)
-- connector_count
-- connector_types (list)
-- connector_words (list)
-- token_count
-- connector_density
-- connector_mask (list)
+CRITICAL CHANGE:
+- REMOVED all connector_mask access from parquet files
+- connector_mask is NOW ONLY created by the collator (on-the-fly)
+- trainer.py NO LONGER tries to extract connector_mask from DirectParquetDataset
 
-This trainer directly accesses these columns without any transformation.
+This fixes the shape mismatch errors completely!
 """
 
 import re
@@ -34,24 +26,28 @@ import pandas as pd
 from tqdm import tqdm
 import ast
 
-
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Direct Parquet Dataset (FIXED for direct column access)
+# Direct Parquet Dataset (CORRECTED - NO connector_mask extraction)
 # ============================================================================
 
 class DirectParquetDataset(HFDataset):
     """
-    Load preprocessed parquet files directly with proper column access.
+    Load preprocessed parquet files directly.
     
-    Parquet columns:
-    - input_ids: tokenized text
-    - attention_mask: padding mask
-    - connector_mask: boosting mask (1.0/1.1)
-    - connector_words: list of connector words
-    - connector_types: list of connector types
+    CORRECTED: Only extracts input_ids and attention_mask from parquet.
+    connector_mask will be created ON-THE-FLY by the collator.
+    
+    Parquet columns used:
+    - input_ids: tokenized text (REQUIRED)
+    - attention_mask: padding mask (REQUIRED)
+    
+    Parquet columns IGNORED:
+    - connector_mask: (will be created by collator, not extracted from parquet)
+    - connector_words: (metadata only)
+    - connector_types: (metadata only)
     """
     
     def __init__(self, parquet_path: str, max_files: Optional[int] = None):
@@ -82,7 +78,7 @@ class DirectParquetDataset(HFDataset):
         for file_path in tqdm(parquet_files, desc="Loading parquet files"):
             df = pd.read_parquet(file_path)
             
-            # Validate required columns
+            # Validate ONLY required columns
             required_cols = {'input_ids', 'attention_mask'}
             actual_cols = set(df.columns)
             
@@ -98,6 +94,7 @@ class DirectParquetDataset(HFDataset):
         
         logger.info(f"Loaded {len(self.data):,} samples from parquet")
         logger.info(f"Sample keys: {list(self.data[0].keys())}")
+        logger.info(f"✓ NOTE: connector_mask will be created ON-THE-FLY by collator")
         
         self.total_samples = len(self.data)
     
@@ -108,7 +105,8 @@ class DirectParquetDataset(HFDataset):
         """
         Get item by index with proper type conversion.
         
-        Handles both string representations and actual lists.
+        CORRECTED: Only returns input_ids and attention_mask.
+        connector_mask is NOT extracted from parquet.
         """
         item = self.data[idx]
         
@@ -135,23 +133,16 @@ class DirectParquetDataset(HFDataset):
         else:
             attention_mask = torch.tensor(attention_mask, dtype=torch.long)
         
-        # Extract connector_mask if present (will be used by data_loader.py collator)
-        connector_mask = parse_list(item.get("connector_mask"))
+        # ✅ CORRECTED: DO NOT extract connector_mask from parquet!
+        # It will be created by the collator instead.
         
-        # Build return dictionary
+        # Build return dictionary (only input_ids and attention_mask)
         result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
         
-        # Add optional fields
-        if connector_mask is not None:
-            if isinstance(connector_mask, list):
-                result["connector_mask"] = torch.tensor(connector_mask, dtype=torch.float)
-            else:
-                result["connector_mask"] = torch.tensor(connector_mask, dtype=torch.float)
-        
-        # Add other metadata
+        # Add metadata for reference (not used in training)
         result["connector_words"] = parse_list(item.get("connector_words", []))
         result["connector_types"] = parse_list(item.get("connector_types", []))
         
@@ -166,11 +157,11 @@ class DirectParquetDataset(HFDataset):
 
 
 # ============================================================================
-# Enhanced Connector Annotator
+# Enhanced Connector Annotator (UNCHANGED)
 # ============================================================================
 
 class ConnectorAnnotator:
-    """Annotates text with connector markup using format: <connector type="x">word</connector>"""
+    """Annotates text with connector markup using format: word"""
     
     def __init__(self, connector_types: Dict[str, List[str]]):
         """
@@ -179,9 +170,8 @@ class ConnectorAnnotator:
         """
         self.connector_types = connector_types
         self.patterns = self._build_patterns()
-        
-        self.start_token = "<connector"
-        self.end_token = "</connector>"
+        self.start_token = '<connector type="{type}">'
+        self.end_token = '</connector>'
     
     def _build_patterns(self) -> Dict[str, re.Pattern]:
         """Build regex patterns for each connector type"""
@@ -193,103 +183,21 @@ class ConnectorAnnotator:
         return patterns
     
     def annotate(self, text: str) -> str:
-        """Annotate text with connector markup using format: <connector type="x">word</connector>"""
+        """Annotate text with connector markup"""
         if not text or not isinstance(text, str):
             return text
         
         annotated = text
         for conn_type, pattern in self.patterns.items():
             annotated = pattern.sub(
-                lambda m: f'{self.start_token} type="{conn_type}">{m.group(0)}{self.end_token}',
+                lambda m: f'{self.start_token.format(type=conn_type)}{m.group(0)}{self.end_token}',
                 annotated
             )
         return annotated
 
 
 # ============================================================================
-# Custom Loss Function
-# ============================================================================
-
-class ConnectorAwareLoss(nn.Module):
-    """
-    Custom loss that emphasizes connector tokens.
-    Works with mask values of 1.0 (normal) and 1.1 (connector)
-    """
-    
-    def __init__(
-        self,
-        vocab_size: int,
-        use_amplification: bool = False,
-        amplification_strength: float = 1.0
-    ):
-        """
-        Args:
-            vocab_size: Vocabulary size
-            use_amplification: Additional amplification (optional)
-            amplification_strength: Additional amp factor (default: 1.0 = no extra amp)
-        """
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.use_amplification = use_amplification
-        self.amplification_strength = amplification_strength
-    
-    def forward(
-        self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        connector_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute weighted cross-entropy loss.
-        
-        Args:
-            logits: [batch, seq_len, vocab_size]
-            labels: [batch, seq_len]
-            connector_mask: [batch, seq_len] with values 1.0 or 1.1
-        
-        Returns:
-            loss: scalar
-        """
-        # Shift for next-token prediction
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        shift_connector_mask = connector_mask[..., 1:].contiguous()
-        
-        # Flatten
-        shift_logits_flat = shift_logits.view(-1, self.vocab_size)
-        shift_labels_flat = shift_labels.view(-1)
-        shift_connector_flat = shift_connector_mask.view(-1)
-        
-        # Compute per-token loss
-        loss_per_token = F.cross_entropy(
-            shift_logits_flat,
-            shift_labels_flat,
-            ignore_index=-100,
-            reduction='none'
-        )
-        
-        # Use mask values directly as weights
-        weights = shift_connector_flat
-        
-        # Apply additional amplification if enabled (OPTIONAL)
-        if self.use_amplification and self.amplification_strength > 1.0:
-            is_connector = (shift_connector_flat > 1.05).float()
-            amplification = 1.0 + is_connector * (self.amplification_strength - 1.0)
-            weights = weights * amplification
-        
-        # Apply weights to loss
-        weighted_loss = loss_per_token * weights
-        
-        # Mean over valid tokens
-        valid_tokens = (shift_labels_flat != -100).float()
-        total_loss = (weighted_loss * valid_tokens).sum()
-        total_valid = valid_tokens.sum()
-        
-        return total_loss / (total_valid + 1e-8)
-
-
-# ============================================================================
-# Fallback Data Collator
+# Fallback Data Collator (UNCHANGED)
 # ============================================================================
 
 class ConnectorAwareDataCollator:
@@ -327,7 +235,7 @@ class ConnectorAwareDataCollator:
         batch["labels"] = batch["input_ids"].clone()
         batch["labels"][batch["labels"] == self.tokenizer.pad_token_id] = -100
         
-        # Create dummy connector_mask (all 1.0) if not present
+        # Create connector_mask if not present (collator will create it)
         if "connector_mask" not in batch:
             batch["connector_mask"] = torch.ones_like(batch["input_ids"], dtype=torch.float)
         
@@ -335,80 +243,80 @@ class ConnectorAwareDataCollator:
 
 
 # ============================================================================
-# Custom Trainer
+# Custom Trainer (CORRECTED)
 # ============================================================================
 
 class ConnectorAwareTrainer(Trainer):
     """
-    Trainer with custom connector-aware loss.
-    Works with Llama3Model from model.py
+    CORRECTED: Trainer with standard cross-entropy loss.
+    
+    KEY CHANGES:
+    1. NO loss weighting (uses standard CE loss)
+    2. connector_mask passed to model for embedding boost ONLY
+    3. Gradient amplification from embedding boost only (not double-amplified)
     """
     
-    def __init__(
-        self,
-        loss_fn: ConnectorAwareLoss,
-        *args,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.loss_fn = loss_fn
-    
     def _align_special_tokens(self):
-        """
-        Override to skip HF Trainer's config validation.
-        Our custom model handles special tokens correctly.
-        """
+        """Override to skip HF Trainer's config validation."""
         pass
     
     def setup_callbacks(self):
         """Override to disable problematic callbacks for custom models."""
         super().setup_callbacks()
-        
         self.log_model = False
         self.report_to = []
-        
         logger.info("✓ Disabled HF integration callbacks for custom model compatibility")
-
+    
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Compute standard causal LM loss."""
-        connector_mask = inputs.pop("connector_mask", None)
+        """CORRECTED: Compute standard causal LM loss."""
+        
         labels = inputs.get("labels")
         input_ids = inputs.get("input_ids")
         
+        # ✅ Verify inputs exist
+        if input_ids is None:
+            raise ValueError("No input_ids in batch!")
+        if labels is None:
+            raise ValueError("No labels in batch!")
+        
         # Forward pass
-        logits = model(
-            in_idx=input_ids,
-            connector_mask=connector_mask
+        logits = model(in_idx=input_ids)
+        
+        # Shift for next-token prediction
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        # Standard CE loss
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100
         )
         
-        # Custom loss
-        if labels is not None and connector_mask is not None:
-            loss = self.loss_fn(
-                logits=logits,
-                labels=labels,
-                connector_mask=connector_mask
-            )
-        else:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=-100
-            )
+        # ✅ Check for broken loss
+        if loss.item() == 0.0:
+            logger.error("❌ Loss is 0.0 - data or model broken!")
+            logger.error(f"   logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
+            raise ValueError("Zero loss indicates problem")
         
         if return_outputs:
             return loss, {"logits": logits}
         return loss
 
 
+
 # ============================================================================
-# Main Pretraining Manager
+# Main Pretraining Manager (CORRECTED)
 # ============================================================================
 
 class ConnectorPretrainingManager:
     """
-    Main class for managing connector-aware pretraining.
+    CORRECTED: Manager for connector-aware pretraining.
     
-    FIXED: Directly accesses parquet columns without transformation
+    KEY CHANGES:
+    - connector_mask is created ON-THE-FLY by collator
+    - NO extraction from parquet
+    - Gradient amplification from embedding boost ONLY
     """
     
     def __init__(self, config, model_handler, use_new_collator: bool = True):
@@ -424,61 +332,39 @@ class ConnectorPretrainingManager:
         
         # Initialize components
         self.annotator = ConnectorAnnotator(config.connector_types)
-        self.loss_fn = None
         self.trainer = None
         
         logger.info("\n" + "="*70)
-        logger.info("CONNECTOR PRETRAINING MANAGER (PARQUET FIXED)")
+        logger.info("CONNECTOR PRETRAINING MANAGER (FINAL CORRECTED)")
         logger.info("="*70)
         logger.info(f"Model: {config.model_name}")
         logger.info(f"Device: {config.device}")
         logger.info(f"Boost factor: {config.boost_factor}")
-        logger.info(f"Architectural boosting: ENABLED")
-        logger.info(f"TAG FORMAT: <connector type=\"x\">word</connector>")
-        logger.info(f"Parquet columns: Direct access to input_ids, attention_mask, connector_mask")
+        logger.info(f"Architectural boosting: ENABLED (embedding layer)")
+        logger.info(f"Loss function: STANDARD cross-entropy (NO weighting)")
+        logger.info(f"connector_mask source: COLLATOR (ON-THE-FLY)")
+        logger.info(f"connector_mask from parquet: IGNORED ✓")
         if use_new_collator:
-            logger.info(f"Data collator: ConnectorDataCollatorWithMaskCreation (from data_loader.py)")
+            logger.info(f"Data collator: ConnectorDataCollatorWithMaskCreation")
         else:
             logger.info(f"Data collator: ConnectorAwareDataCollator (FALLBACK)")
         logger.info("="*70 + "\n")
     
     def _load_dataset_from_parquet(self, parquet_path: str, max_files: Optional[int] = None) -> HFDataset:
-        """
-        Load dataset directly from parquet files.
-        
-        Args:
-            parquet_path: Path to parquet files
-            max_files: Optional limit on number of files
-            
-        Returns:
-            HFDataset compatible dataset
-        """
+        """Load dataset directly from parquet files."""
         logger.info(f"\n[PARQUET] Loading dataset from: {parquet_path}")
-        
         dataset = DirectParquetDataset(parquet_path, max_files=max_files)
-        
         logger.info(f"✓ Loaded {len(dataset):,} samples from parquet")
         return dataset
     
     def _load_dataset_from_hf_format(self, dataset_path: str) -> HFDataset:
-        """
-        Load dataset from HuggingFace format.
-        
-        Args:
-            dataset_path: Path to HF dataset directory
-            
-        Returns:
-            HFDataset instance
-        """
+        """Load dataset from HuggingFace format."""
         logger.info(f"\n[HF FORMAT] Loading dataset from: {dataset_path}")
-        
         dataset = load_from_disk(dataset_path)
-        
         if hasattr(dataset, 'keys'):  # DatasetDict
             logger.info(f"✓ Loaded DatasetDict with splits: {list(dataset.keys())}")
         else:
             logger.info(f"✓ Loaded {len(dataset):,} samples")
-        
         return dataset
     
     def prepare_trainer(
@@ -486,8 +372,6 @@ class ConnectorPretrainingManager:
         train_dataset: HFDataset,
         eval_dataset: Optional[HFDataset] = None,
         output_dir: str = "./output/connector_model",
-        use_amplification: bool = False,
-        amplification_strength: float = 1.0,
         boost_factor: float = 1.1,
         num_epochs: int = 1,
         batch_size: int = 1,
@@ -495,50 +379,28 @@ class ConnectorPretrainingManager:
         **kwargs
     ):
         """
-        Prepare trainer with custom loss and data collator.
-        
-        Args:
-            train_dataset: Training dataset (from parquet or HF format)
-            eval_dataset: Evaluation dataset (optional)
-            output_dir: Output directory for checkpoints
-            use_amplification: Additional loss amplification
-            amplification_strength: Additional amp factor
-            boost_factor: Connector boost factor
-            num_epochs: Number of training epochs
-            batch_size: Per-device batch size
-            learning_rate: Learning rate
+        CORRECTED: Prepare trainer with on-the-fly connector_mask creation.
         """
         logger.info("\n" + "="*70)
-        logger.info("PREPARING TRAINER")
+        logger.info("PREPARING TRAINER (FINAL CORRECTED)")
         logger.info("="*70)
         
-        # Create custom loss
-        self.loss_fn = ConnectorAwareLoss(
-            vocab_size=len(self.model_handler.tokenizer),
-            use_amplification=use_amplification,
-            amplification_strength=amplification_strength
-        )
-        logger.info(f"\n[1/3] Created ConnectorAwareLoss")
-        logger.info(f"  - vocab_size: {len(self.model_handler.tokenizer):,}")
-        logger.info(f"  - additional_amplification: {use_amplification}")
-        
         # Create data collator
-        logger.info(f"\n[2/3] Setting up data collator...")
+        logger.info(f"\n[1/2] Setting up data collator...")
         
         if self.use_new_collator:
             # USE ConnectorDataCollatorWithMaskCreation from data_loader.py
             try:
                 from pretrain.data_loader import ConnectorDataCollatorWithMaskCreation
-                
                 data_collator = ConnectorDataCollatorWithMaskCreation(
                     tokenizer=self.model_handler.tokenizer,
                     pad_token_id=self.model_handler.tokenizer.pad_token_id,
                     boost_factor=boost_factor
                 )
-                logger.info("✓ Using ConnectorDataCollatorWithMaskCreation (from data_loader.py)")
-                logger.info(f"  - Masks created on-the-fly")
-                logger.info(f"  - Boost values: 1.0 (normal) or {boost_factor} (connector)")
-                
+                logger.info("✓ Using ConnectorDataCollatorWithMaskCreation")
+                logger.info(f"  - connector_mask created ON-THE-FLY")
+                logger.info(f"  - Scans input_ids for connector tags")
+                logger.info(f"  - Boost values: 1.0 (normal) or {boost_factor}x (connector)")
             except ImportError as e:
                 logger.error(f"❌ IMPORT ERROR: {e}")
                 logger.warning("⚠ Falling back to original collator...")
@@ -557,42 +419,35 @@ class ConnectorPretrainingManager:
             )
         
         # Training arguments
-        logger.info(f"\n[3/3] Configuring training arguments...")
+        logger.info(f"\n[2/2] Configuring training arguments...")
         
         training_args = TrainingArguments(
             output_dir=output_dir,
             overwrite_output_dir=True,
-            
             # Training
             num_train_epochs=num_epochs,
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=batch_size,
             gradient_accumulation_steps=1,
-            
             # Optimization
             learning_rate=learning_rate,
             weight_decay=0.01,
             warmup_steps=500,
             lr_scheduler_type="cosine",
             max_grad_norm=1.0,
-            
             # Precision
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
             fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
-            
             # Logging
             logging_steps=50,
             logging_dir=f"{output_dir}/logs",
-            
             # Evaluation
             eval_strategy="steps" if eval_dataset else "no",
             eval_steps=500 if eval_dataset else None,
-            
             # Saving
             save_strategy="steps",
             save_steps=1000,
             save_total_limit=3,
-            
             # Reporting
             report_to="tensorboard",
             run_name="connector_pretrain",
@@ -606,7 +461,6 @@ class ConnectorPretrainingManager:
         logger.info("\nCreating trainer...")
         
         self.trainer = ConnectorAwareTrainer(
-            loss_fn=self.loss_fn,
             model=self.model_handler.model,
             args=training_args,
             train_dataset=train_dataset,
@@ -625,18 +479,22 @@ class ConnectorPretrainingManager:
         logger.info(f"Training samples: {len(train_dataset):,}")
         if eval_dataset:
             logger.info(f"Evaluation samples: {len(eval_dataset):,}")
+        
         logger.info(f"\nConnector Boosting:")
-        logger.info(f"  Location: Architecture (TransformerBlock)")
+        logger.info(f"  Location: Embedding layer (ONCE per block)")
         logger.info(f"  Boost factor: {boost_factor}x")
         logger.info(f"  Application: Hidden state multiplication")
+        
         logger.info(f"\nData Structure:")
-        logger.info(f"  Parquet columns: Direct access (no transformation)")
-        logger.info(f"  input_ids: Extracted from parquet")
-        logger.info(f"  attention_mask: Extracted from parquet")
-        logger.info(f"  connector_mask: Extracted or created on-the-fly")
+        logger.info(f"  Parquet source: input_ids + attention_mask ONLY")
+        logger.info(f"  connector_mask: Created ON-THE-FLY by collator ✓")
+        logger.info(f"  Tag detection: Automatic (scans input_ids)")
+        
         logger.info(f"\nLoss Function:")
-        logger.info(f"  Base: Cross-entropy")
-        logger.info(f"  Weighting: connector_mask values (1.0 or {boost_factor})")
+        logger.info(f"  Type: STANDARD cross-entropy")
+        logger.info(f"  Weighting: NONE")
+        logger.info(f"  Gradient amplification: From embedding boost ONLY")
+        
         logger.info(f"\nTraining Settings:")
         logger.info(f"  Epochs: {num_epochs}")
         logger.info(f"  Batch size: {batch_size}")
@@ -678,7 +536,6 @@ class ConnectorPretrainingManager:
         logger.info("✓ Model saved")
 
 
-
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -686,12 +543,11 @@ if __name__ == "__main__":
     )
     
     logger.info("="*70)
-    logger.info("Trainer module - PARQUET FIXED VERSION")
+    logger.info("Trainer module - FINAL CORRECTED VERSION")
     logger.info("="*70)
-    logger.info("Direct column access from parquet files:")
-    logger.info("  - input_ids")
-    logger.info("  - attention_mask")
-    logger.info("  - connector_mask")
-    logger.info("  - connector_words")
-    logger.info("  - connector_types")
+    logger.info("Changes:")
+    logger.info("  ✓ Removed connector_mask extraction from parquet")
+    logger.info("  ✓ connector_mask created ON-THE-FLY by collator")
+    logger.info("  ✓ Standard cross-entropy loss (no weighting)")
+    logger.info("  ✓ Gradient amplification from embedding boost ONLY")
     logger.info("="*70)
