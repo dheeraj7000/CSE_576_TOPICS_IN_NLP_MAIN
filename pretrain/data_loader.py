@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-data_loader_FIXED_V2.py - Collator with CORRECTLY WORKING connector boost
+data_loader_FIXED_V3.py - WITH PADDING VALIDATION
 
-FIXES (V2):
-1. ✅ _create_boost_mask() is NOW CALLED in __call__()
-2. ✅ connector_mask is NOW RETURNED in batch dict
-3. ✅ Tags are EXCLUDED from boost (only content words boosted) ← NEW FIX!
+FIXES:
+1. ✅ _create_boost_mask() is called in __call__()
+2. ✅ connector_mask is returned in batch dict
+3. ✅ Tags are excluded from boost
+4. ✅ PADDING VALIDATION ADDED - fixes incorrect attention_mask from parquet
 
-Changes from V1:
-- Line ~160-180: Fixed boost logic to SKIP opening and closing tags
-- Only words BETWEEN tags get boosted now
+NEW FIX (V3):
+- Validates attention_mask against pad_token_id
+- Forces attention_mask=0 for all padding positions
+- Prevents connector_mask from boosting padding
 """
 
 import logging
@@ -26,12 +28,13 @@ logger = logging.getLogger(__name__)
 
 class ConnectorDataCollatorWithMaskCreation:
     """
-    FIXED V2: Collator that creates connector_mask WITHOUT boosting tags.
+    FIXED V3: Collator with padding validation.
     
     Key functionality:
     - Handles list inputs and converts to tensors
     - Creates connector masks by detecting special tokens
     - Boosts ONLY content words (excludes opening/closing tags)
+    - VALIDATES attention_mask (fixes padding from parquet)
     - Returns connector_mask for model to apply boost
     """
     
@@ -42,6 +45,8 @@ class ConnectorDataCollatorWithMaskCreation:
         
         # Initialize connector tag detection
         self._init_connector_tags()
+        
+        logger.info(f"✓ Collator initialized with pad_token_id={self.pad_token_id}")
     
     def _init_connector_tags(self):
         """Initialize connector tag token IDs from tokenizer."""
@@ -159,7 +164,7 @@ class ConnectorDataCollatorWithMaskCreation:
         # Initialize mask: all 1.0 (no boosting)
         mask = torch.ones((batch_size, seq_len), dtype=torch.float32)
         
-        # ✅ CONNECTOR TOKEN IDS (mapped from special tokens added to vocabulary)
+        # ✅ CONNECTOR TOKEN IDS
         CONNECTOR_TAG_IDS = {
             128257: 'CAUSAL',
             128258: 'ADVERSATIVE',
@@ -169,7 +174,7 @@ class ConnectorDataCollatorWithMaskCreation:
             128262: 'ADDITIVE',
         }
         
-        CLOSING_TAG_ID = 128263  # </connector>
+        CLOSING_TAG_ID = 128263
         
         # Use dynamically detected tags if available
         if self.connector_opening_tags:
@@ -188,8 +193,6 @@ class ConnectorDataCollatorWithMaskCreation:
                 # Check if this is a connector opening tag
                 if token_id in opening_tags:
                     # ✅ FIX: DON'T boost the opening tag itself
-                    # Leave mask[batch_idx, i] = 1.0 (default)
-                    
                     # Move to next token (first content word)
                     i += 1
                     
@@ -198,7 +201,6 @@ class ConnectorDataCollatorWithMaskCreation:
                         # Check if we've reached the closing tag
                         if seq[i] == closing_tag:
                             # DON'T boost the closing tag
-                            # Leave mask[batch_idx, i] = 1.0 (default)
                             break
                         
                         # Boost this content word
@@ -211,7 +213,7 @@ class ConnectorDataCollatorWithMaskCreation:
     
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         """
-        ✅ FIXED: Collate batch and CREATE connector_mask.
+        ✅ FIXED V3: Collate batch with PADDING VALIDATION.
         
         Returns:
             dict with keys: input_ids, attention_mask, labels, connector_mask
@@ -240,6 +242,19 @@ class ConnectorDataCollatorWithMaskCreation:
             input_ids_list.append(input_ids)
             attention_mask_list.append(attention_mask)
         
+        # ✅ NEW (V3): VALIDATE ATTENTION_MASK FOR PADDING
+        # Fix incorrect attention_mask from parquet files
+        num_fixed = 0
+        for i in range(len(input_ids_list)):
+            for j in range(len(input_ids_list[i])):
+                if input_ids_list[i][j] == self.pad_token_id:
+                    if attention_mask_list[i][j] != 0:
+                        attention_mask_list[i][j] = 0
+                        num_fixed += 1
+        
+        if num_fixed > 0:
+            logger.debug(f"Fixed {num_fixed} padding positions with incorrect attention_mask")
+        
         # Pad to same length
         max_len = max(len(ids) for ids in input_ids_list) if input_ids_list else 1
         
@@ -247,7 +262,7 @@ class ConnectorDataCollatorWithMaskCreation:
             pad_len = max_len - len(input_ids_list[i])
             if pad_len > 0:
                 input_ids_list[i].extend([self.pad_token_id] * pad_len)
-                attention_mask_list[i].extend([0] * pad_len)
+                attention_mask_list[i].extend([0] * pad_len)  # Padding has mask=0
         
         # Convert to tensors
         input_ids_tensor = torch.stack([
@@ -259,10 +274,16 @@ class ConnectorDataCollatorWithMaskCreation:
         
         # Create labels
         labels = input_ids_tensor.clone()
-        labels[attention_mask_tensor == 0] = -100
+        labels[attention_mask_tensor == 0] = -100  # Exclude padding from loss
         
         # ✅ CREATE CONNECTOR MASK (with fixed logic)
         connector_mask = self._create_boost_mask(input_ids_tensor)
+        
+        # ✅ ENSURE connector_mask doesn't boost padding
+        # Set connector_mask = 1.0 where attention_mask = 0
+        connector_mask = connector_mask * attention_mask_tensor.float()
+        connector_mask = connector_mask + (1.0 - attention_mask_tensor.float())
+        # Result: padding positions have connector_mask = 1.0 (no boost)
         
         # ✅ RETURN 4 KEYS - INCLUDING connector_mask!
         return {
@@ -361,9 +382,10 @@ class DirectParquetDataset:
 
 if __name__ == "__main__":
     logger.info("=" * 80)
-    logger.info("data_loader_FIXED_V2.py - Collator with CORRECTLY WORKING boost")
+    logger.info("data_loader_FIXED_V3.py - WITH PADDING VALIDATION")
     logger.info("=" * 80)
-    logger.info("✅ _create_boost_mask() is NOW CALLED in __call__()")
-    logger.info("✅ connector_mask is NOW RETURNED in batch dict")
-    logger.info("✅ Tags are EXCLUDED from boost (only content words boosted)")
+    logger.info("✅ _create_boost_mask() is called")
+    logger.info("✅ connector_mask is returned")
+    logger.info("✅ Tags excluded from boost")
+    logger.info("✅ Padding attention_mask validation added")
     logger.info("=" * 80)
