@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-data_loader_fixed_final.py - COLLATOR THAT HANDLES LISTS → TENSORS
+data_loader_FIXED_V2.py - Collator with CORRECTLY WORKING connector boost
 
-FIXED: The collator now converts lists to tensors automatically.
+FIXES (V2):
+1. ✅ _create_boost_mask() is NOW CALLED in __call__()
+2. ✅ connector_mask is NOW RETURNED in batch dict
+3. ✅ Tags are EXCLUDED from boost (only content words boosted) ← NEW FIX!
 
-The issue:
-- Collator expects: tensor inputs
-- Collator receives: list inputs (because HF Trainer bypasses wrappers)
-- Result: torch.stack fails on lists
-
-Solution:
-- Check if input is list or tensor.
-- Convert lists to tensors IN THE COLLATOR
-- Then proceed with stacking
+Changes from V1:
+- Line ~160-180: Fixed boost logic to SKIP opening and closing tags
+- Only words BETWEEN tags get boosted now
 """
 
 import logging
@@ -29,13 +26,13 @@ logger = logging.getLogger(__name__)
 
 class ConnectorDataCollatorWithMaskCreation:
     """
-    FIXED: Collator that handles list inputs and converts to tensors.
+    FIXED V2: Collator that creates connector_mask WITHOUT boosting tags.
     
-    Key fix:
-    - Checks if batch items are lists or tensors
-    - Converts lists to tensors automatically
-    - Handles string values (converts to int)
-    - Creates connector masks
+    Key functionality:
+    - Handles list inputs and converts to tensors
+    - Creates connector masks by detecting special tokens
+    - Boosts ONLY content words (excludes opening/closing tags)
+    - Returns connector_mask for model to apply boost
     """
     
     def __init__(self, tokenizer, pad_token_id=None, boost_factor=1.1):
@@ -100,7 +97,7 @@ class ConnectorDataCollatorWithMaskCreation:
     
     def _ensure_int_list(self, values):
         """
-        FIXED: Convert values to integer list.
+        Convert values to integer list.
         
         Handles:
         - None → []
@@ -127,87 +124,85 @@ class ConnectorDataCollatorWithMaskCreation:
     
     def _create_boost_mask(self, input_ids, connector_types_mapping=None):
         """
-        ✅ SMART: Create connector boost mask by detecting connector tags in input_ids.
+        ✅ FIXED V2: Create connector boost mask WITHOUT boosting tags.
         
         Algorithm:
-        1. Scan input_ids for connector opening tags (128010-128015)
-        2. When found, identify the connector type from token ID
-        3. Mark all tokens between opening and closing tag with 1.1
-        4. All other tokens marked 1.0
+        1. Scan input_ids for connector opening tags
+        2. When found, SKIP the opening tag (don't boost it)
+        3. Boost all tokens AFTER opening tag
+        4. When closing tag found, STOP (don't boost closing tag)
+        5. All other tokens marked 1.0
+        
+        Example:
+            Tokens: [... <opener> word1 word2 </closer> ...]
+            Boost:  [... 1.0      1.1   1.1   1.0      ...]
+                         ↑ skip        boost    ↑ skip
+        
+        Args:
+            input_ids: Tensor of shape (batch_size, seq_len)
+            connector_types_mapping: Optional dict (not used, for future)
+        
+        Returns:
+            mask: Tensor of shape (batch_size, seq_len) with values 1.0 or boost_factor
         """
+        # Handle both tensor and list inputs
         if isinstance(input_ids, torch.Tensor):
-            input_ids = input_ids.tolist()
-        
-        if not input_ids or len(input_ids) == 0:
-            return torch.tensor([[1.0]], dtype=torch.float32)
-        
-        # Determine batch/seq dimensions
-        if isinstance(input_ids, list):
+            batch_size, seq_len = input_ids.shape
+            input_ids_list = input_ids.tolist()
+        elif isinstance(input_ids, list):
             batch_size = len(input_ids)
-            seq_len = len(input_ids)
+            seq_len = len(input_ids[0]) if input_ids else 1
+            input_ids_list = input_ids
         else:
-            batch_size = 1
-            seq_len = len(input_ids)
+            return torch.ones((1, 1), dtype=torch.float32)
         
         # Initialize mask: all 1.0 (no boosting)
         mask = torch.ones((batch_size, seq_len), dtype=torch.float32)
         
         # ✅ CONNECTOR TOKEN IDS (mapped from special tokens added to vocabulary)
-        # These correspond to the opening tags added to tokenizer
         CONNECTOR_TAG_IDS = {
-            128257: 'CAUSAL',      # <connector type="CAUSAL">
-            128258: 'ADVERSATIVE', # <connector type="ADVERSATIVE">
-            128259: 'TEMPORAL',    # <connector type="TEMPORAL">
-            128260: 'CONDITIONAL', # <connector type="CONDITIONAL">
-            128261: 'CONCLUSIVE',  # <connector type="CONCLUSIVE">
-            128262: 'ADDITIVE',    # <connector type="ADDITIVE">
+            128257: 'CAUSAL',
+            128258: 'ADVERSATIVE',
+            128259: 'TEMPORAL',
+            128260: 'CONDITIONAL',
+            128261: 'CONCLUSIVE',
+            128262: 'ADDITIVE',
         }
         
         CLOSING_TAG_ID = 128263  # </connector>
         
-        # Process single or batch
-        if isinstance(input_ids, list):
-            # Batch mode
-            for batch_idx, seq in enumerate(input_ids):
-                i = 0
-                while i < len(seq):
-                    token_id = seq[i]
-                    
-                    # Check if this is a connector opening tag
-                    if token_id in CONNECTOR_TAG_IDS:
-                        connector_type = CONNECTOR_TAG_IDS[token_id]
-                        
-                        # Mark opening tag
-                        mask[batch_idx, i] = 1.1
-                        
-                        # Mark all tokens until closing tag
-                        i += 1
-                        while i < len(seq):
-                            mask[batch_idx, i] = 1.1
-                            if seq[i] == CLOSING_TAG_ID:
-                                break
-                            i += 1
-                    
-                    i += 1
+        # Use dynamically detected tags if available
+        if self.connector_opening_tags:
+            opening_tags = self.connector_opening_tags
+            closing_tag = self.connector_closing_tag_id
         else:
-            # Single sequence mode
+            opening_tags = set(CONNECTOR_TAG_IDS.keys())
+            closing_tag = CLOSING_TAG_ID
+        
+        # Process each sequence in batch
+        for batch_idx, seq in enumerate(input_ids_list):
             i = 0
-            while i < len(input_ids):
-                token_id = input_ids[i]
+            while i < len(seq):
+                token_id = seq[i]
                 
                 # Check if this is a connector opening tag
-                if token_id in CONNECTOR_TAG_IDS:
-                    connector_type = CONNECTOR_TAG_IDS[token_id]
+                if token_id in opening_tags:
+                    # ✅ FIX: DON'T boost the opening tag itself
+                    # Leave mask[batch_idx, i] = 1.0 (default)
                     
-                    # Mark opening tag
-                    mask[0, i] = 1.1
-                    
-                    # Mark all tokens until closing tag
+                    # Move to next token (first content word)
                     i += 1
-                    while i < len(input_ids):
-                        mask[0, i] = 1.1
-                        if input_ids[i] == CLOSING_TAG_ID:
+                    
+                    # ✅ FIX: Boost tokens BETWEEN tags (not including closing tag)
+                    while i < len(seq):
+                        # Check if we've reached the closing tag
+                        if seq[i] == closing_tag:
+                            # DON'T boost the closing tag
+                            # Leave mask[batch_idx, i] = 1.0 (default)
                             break
+                        
+                        # Boost this content word
+                        mask[batch_idx, i] = self.boost_factor
                         i += 1
                 
                 i += 1
@@ -215,12 +210,17 @@ class ConnectorDataCollatorWithMaskCreation:
         return mask
     
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
-        """FINAL: Collate batch - ONLY return what's needed!"""
+        """
+        ✅ FIXED: Collate batch and CREATE connector_mask.
+        
+        Returns:
+            dict with keys: input_ids, attention_mask, labels, connector_mask
+        """
         
         if not batch:
             raise ValueError("Empty batch")
         
-        # Extract ONLY input_ids and attention_mask
+        # Extract input_ids and attention_mask
         input_ids_list = []
         attention_mask_list = []
         
@@ -261,11 +261,15 @@ class ConnectorDataCollatorWithMaskCreation:
         labels = input_ids_tensor.clone()
         labels[attention_mask_tensor == 0] = -100
         
-        # ✅ RETURN ONLY 3 KEYS - NO connector_mask!
+        # ✅ CREATE CONNECTOR MASK (with fixed logic)
+        connector_mask = self._create_boost_mask(input_ids_tensor)
+        
+        # ✅ RETURN 4 KEYS - INCLUDING connector_mask!
         return {
             "input_ids": input_ids_tensor,
             "attention_mask": attention_mask_tensor,
             "labels": labels,
+            "connector_mask": connector_mask,
         }
 
 
@@ -324,7 +328,6 @@ class DirectParquetDataset:
         # Extract fields
         input_ids = item.get("input_ids", [])
         attention_mask = item.get("attention_mask", [])
-        # connector_mask = item.get("connector_mask")
         
         # Ensure lists
         if isinstance(input_ids, str):
@@ -341,13 +344,6 @@ class DirectParquetDataset:
             except:
                 attention_mask = []
         
-        # if isinstance(connector_mask, str):
-        #     try:
-        #         import ast
-        #         connector_mask = ast.literal_eval(connector_mask)
-        #     except:
-        #         connector_mask = None
-        
         # Ensure proper types
         if isinstance(input_ids, list) and len(input_ids) > 0 and isinstance(input_ids[0], str):
             input_ids = [int(x) for x in input_ids]
@@ -355,13 +351,9 @@ class DirectParquetDataset:
         if isinstance(attention_mask, list) and len(attention_mask) > 0 and isinstance(attention_mask[0], str):
             attention_mask = [int(x) for x in attention_mask]
         
-        # if connector_mask is not None and isinstance(connector_mask, list) and len(connector_mask) > 0 and isinstance(connector_mask[0], str):
-        #     connector_mask = [float(x) for x in connector_mask]
-        
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            # "connector_mask": connector_mask,
             "connector_words": item.get("connector_words", []),
             "connector_types": item.get("connector_types", []),
         }
@@ -369,7 +361,9 @@ class DirectParquetDataset:
 
 if __name__ == "__main__":
     logger.info("=" * 80)
-    logger.info("data_loader_fixed_final.py - COLLATOR THAT HANDLES LIST → TENSOR")
+    logger.info("data_loader_FIXED_V2.py - Collator with CORRECTLY WORKING boost")
     logger.info("=" * 80)
-    logger.info("Key fix: Collator now converts lists to tensors automatically")
+    logger.info("✅ _create_boost_mask() is NOW CALLED in __call__()")
+    logger.info("✅ connector_mask is NOW RETURNED in batch dict")
+    logger.info("✅ Tags are EXCLUDED from boost (only content words boosted)")
     logger.info("=" * 80)
