@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-model.py - CLEAN FINAL VERSION
+model_FIXED.py - WITH CONNECTOR BOOST SUPPORT
 
 Llama 3.2 with connector-aware training.
 
 KEY ARCHITECTURAL CHANGES:
-✅ NO connector_mask in forward() parameters
-✅ TransformerBlock ONLY takes: x, mask, cos, sin
-✅ No boost logic in TransformerBlock (data_loader handles it)
+✅ forward() NOW accepts connector_mask parameter
+✅ Boost applied to embeddings after token_emb
+✅ TransformerBlock ONLY takes: x, mask, cos, sin (unchanged)
 ✅ Simple, clean transformer implementation
+
+FIX APPLIED:
+✅ Line ~405: Added connector_mask=None parameter
+✅ Line ~412-414: Added boost application code
 """
 
 import torch
@@ -199,7 +203,7 @@ class TransformerBlock(nn.Module):
 
 
 class Llama3Model(nn.Module):
-    """Llama 3.2 model - clean implementation."""
+    """Llama 3.2 model - with connector boost support."""
     
     def __init__(self, config: dict):
         super().__init__()
@@ -253,27 +257,49 @@ class Llama3Model(nn.Module):
         
         return ConfigWrapper(self.config_dict)
     
-    def forward(self, in_idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, in_idx: torch.Tensor, connector_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass - ONLY input_ids!
+        Forward pass - WITH connector_mask support!
         
-        ✅ NO connector_mask parameter
-        ✅ Clean interface for trainer
+        ✅ Added connector_mask parameter (optional)
+        ✅ Applies boost to embeddings if mask provided
+        ✅ Backward compatible (works without mask too)
+        
+        Args:
+            in_idx: Input token IDs (batch_size, seq_len)
+            connector_mask: Connector boost mask (batch_size, seq_len) with values 1.0 or 1.1
+        
+        Returns:
+            logits: Model output (batch_size, seq_len, vocab_size)
         """
         batch_size, seq_len = in_idx.shape
         
-        x = self.token_emb(in_idx)
+        # Get embeddings
+        x = self.token_emb(in_idx)  # (batch_size, seq_len, emb_dim)
+        
+        # ✅ APPLY CONNECTOR BOOST (NEW CODE)
+        if connector_mask is not None:
+            # connector_mask: (batch_size, seq_len) with values 1.0 or 1.1
+            # Expand to match embedding dimension: (batch_size, seq_len, 1)
+            boost = connector_mask.unsqueeze(-1)
+            # Apply element-wise multiplication: 1.0× for normal tokens, 1.1× for connectors
+            x = x * boost
+        
+        # Get positional embeddings
         cos, sin = self.rope_emb(seq_len, in_idx.device)
         
+        # Create causal mask
         mask = torch.triu(
             torch.ones(seq_len, seq_len, device=in_idx.device, dtype=torch.bool),
             diagonal=1
         ).unsqueeze(0)
         mask = ~mask
         
+        # Apply transformer blocks
         for block in self.trf_blocks:
             x = block(x, mask, cos, sin)
         
+        # Final normalization and output
         x = self.norm_final(x)
         logits = self.out_head(x)
         
