@@ -17,9 +17,16 @@ class Config:
     
     # Model Configuration
     model_name: str = "meta-llama/Llama-3.2-3B"
+    tokenizer_path: str = "./tokenizer_extended"
     device: str = "cuda"
     torch_dtype: str = "bfloat16"
     
+    data_dir: str = "data_splits"
+    files_per_chunk: int = 5
+    batch_size: int = 16
+    train_pattern: str = "train_chunk_*.parquet"
+    max_batches_to_print: int = 20
+
     # Connector Boosting
     use_connector_boost: bool = True
     boost_factor: float = 1.1

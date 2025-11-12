@@ -1,0 +1,57 @@
+================================================================================
+DECODED TEXT FROM: data_splits/train_chunk_000.parquet
+================================================================================
+
+
+================================================================================
+SAMPLE #2
+================================================================================
+Total tokens: 2048
+Real tokens: 2048
+Connector tokens: 0
+
+================================================================================
+COMPLETE DECODED TEXT
+================================================================================
+<|begin_of_text|>red supergiants ( rsgs ) are the evolved, he - burning descendents of moderately massive ( @xmath10 ) o <connector type="ADDITIVE"> and </connector> b stars.
+we have recently used the new generation of marcs stellar atmosphere models ( gustafsson et al.
+1975, 2003 ; plez et al.  1992 ) to fit optical spectrophotometry of 74 milky way rsgs, from which we derived a new effective temperature scale <connector type="CAUSAL"> for </connector> rsgs of galactic metallicity ( levesque et al.
+2005, hereafter paper i ).
+a subsample of 62 of these stars belong to ob associations with known distances, which allowed us to determine other physical properties, <connector type="ADDITIVE"> such as </connector> bolometric luminosity <connector type="ADDITIVE"> and </connector> stellar radii, <connector type="CAUSAL"> for </connector> comparison with those predicted by stellar evolutionary models.
+we found excellent agreement, <connector type="CAUSAL"> thus </connector> removing a major discrepancy between  observation " <connector type="ADDITIVE"> and </connector> theory <connector type="CAUSAL"> for </connector> massive star evolution ( see massey 2003 ).
+<connector type="ADVERSATIVE"> however </connector>, that study underscored the difficulty in correcting <connector type="CAUSAL"> for </connector> reddening <connector type="CAUSAL"> due to </connector> dust <connector type="CAUSAL"> for </connector> these objects ; our work hinted at several <connector type="TEMPORAL"> previously </connector> neglected problems, which we consider more fully here.
+<connector type="TEMPORAL"> first </connector> ( sec.  [ sec - rv ] ), we find that previous efforts involving broad - band filter photometry have led to systematically underestimating the visual extinctions, <connector type="ADDITIVE"> and </connector> <connector type="CAUSAL"> thus </connector> to underestimating the stellar luminosities.
+<connector type="ADVERSATIVE"> although </connector> we successfully avoided that problem in paper  i by using spectrophotometry to derive reddenings, our work revealed that many of these stars suffer extinction beyond that of their neighboring o <connector type="ADDITIVE"> and </connector> b stars.
+we show here ( sec.  [ sec - av ] ) that this is likely caused by circumstellar dust from these  smoky " stars.
+<connector type="ADVERSATIVE"> although </connector> future studies will attempt to derive the reddening law <connector type="CAUSAL"> for </connector> this dust, it is already clear that the circumstellar dust results in a near - uv excess compared to the stellar models reddened with the  standard " reddening law ( sec.
+[ sec - nuv ] ).
+<connector type="TEMPORAL"> finally </connector>, we use the results of paper i <connector type="ADDITIVE"> and </connector> the current study to estimate the fraction of dust deposited in the diffuse interstellar medium compared to that of other sources in the galaxy ( sec.
+[ sec - cosmic ] ).
+a knowledge of the ratio of total to selective extinction @xmath12 is needed <connector type="CAUSAL"> in order to </connector> derive physical parameters of reddened stars. using _ early - type _ stars with moderate reddenings in the milky way, sneden et al.
+( 1978 ) <connector type="ADDITIVE"> and </connector> others found @xmath11 to be typically 3.1, <connector type="ADVERSATIVE"> although </connector> it is now well understood that this value is not universal in nature, <connector type="ADVERSATIVE"> but </connector> represents the average sightline through the diffuse interstellar medium ( valencic et al.
+values of @xmath13 <connector type="ADDITIVE"> and </connector> even higher have been found <connector type="CAUSAL"> for </connector> stars in dense molecular clouds ; see, <connector type="ADDITIVE"> for example </connector>, cardelli & wallerstein ( 1989 ) <connector type="ADDITIVE"> and </connector> cardelli et al.
+( 1989, hereafter ccm89 ).
+these _ physical _ variations of @xmath11 are <connector type="CAUSAL"> due to </connector> differences in the line - of - sight environment, <connector type="ADDITIVE"> such as </connector> the grain size distribution.
+<connector type="ADVERSATIVE"> however </connector>, aside from such real differences in the dust properties, one must employ a larger _ effective _ value of @xmath11 ( which we will denote <connector type="CAUSAL"> as </connector> @xmath14 ) <connector type="TEMPORAL"> when </connector> correcting broad - band photometry of objects whose spectral energy distributions differ from that of lightly- to moderately - reddened o stars.
+this is simply <connector type="CAUSAL"> due to </connector> the shift of the effective wavelength of the filters compared to that obtained with early - type stars.
+a very red star shifts the effective wavelengths of the @xmath1 <connector type="ADDITIVE"> and </connector> @xmath0 filters to longer wavelengths, where extinction is less, making both @xmath15 <connector type="ADDITIVE"> and </connector> @xmath16 smaller <connector type="CAUSAL"> for </connector> a given amount of dust.
+the net effect of lowering @xmath15 <connector type="ADDITIVE"> and </connector> @xmath16 is to _ increase _
+@xmath14, <connector type="CAUSAL"> as </connector> the decrease in the denominator of the ratio outweighs the decrease of the numerator.
+mccall ( 2004 ) has recently emphasized the importance of considering the spectral energy distribution ( sed ) of the source <connector type="TEMPORAL"> when </connector> correcting <connector type="CAUSAL"> for </connector> extinction in galaxy photometry, <connector type="CAUSAL"> as </connector> their seds do not, <connector type="ADVERSATIVE"> after all </connector>, resemble that of the ob stars <connector type="CAUSAL"> for </connector> which the extinction laws were derived.
+we avoided this problem in paper  i by using spectrophotometry of the stars to measure the color excess with regard the marcs models, employing the ccm89 reddening law.
+<connector type="CAUSAL"> since </connector> neither the _ b _ nor _ v _ filters were <connector type="ADDITIVE"> actually </connector> used in our color excesses, conversion to @xmath16 was straight - forward, <connector type="ADVERSATIVE"> although </connector> it did assume that the reddenings had a  typical " @xmath3 value. <connector type="CAUSAL"> for </connector> broad - band photometry of rsgs,
+a value of @xmath17 has usually been adopted ( lee 1970, humphreys 1978 ), <connector type="ADDITIVE"> and </connector> is consistent with the scaling of @xmath14 with color proposed by schmidt - kaler ( 1982 ).
+<connector type="ADVERSATIVE"> however </connector>, our work in paper  i has forced us <connector type="CONCLUSIVE"> to conclude </connector> that this value is not very accurate, <connector type="CAUSAL"> as </connector> it produced @xmath16 values that were systematically smaller than extinction values derived from our spectrophotometry.
+we have derived an improved value <connector type="CAUSAL"> for </connector> the effective @xmath14 of rsgs by convolving the marcs models with the standard @xmath1 <connector type="ADDITIVE"> and </connector> @xmath0 band - passes ( bessell 1990 ).
+we used the ccm89 reddening law with @xmath3 to add various amounts of reddening to the model spectra ; we <connector type="TEMPORAL"> then </connector> computed the resulting change in the flux in the @xmath0 filter to find @xmath16, <connector type="ADDITIVE"> and </connector> the differences in the relative fluxes in the @xmath1 <connector type="ADDITIVE"> and </connector> @xmath0 filters ( compared to the no - reddening case ) <connector type="CAUSAL"> in order to </connector> determine @xmath18.
+the effective value of @xmath19 <connector type="TEMPORAL"> then </connector> follows directly.
+we found that there is a significant dependence upon the assumed surface gravity @xmath20 in the sense that stars with higher @xmath20 ( 0.5 ) produce lower @xmath11 values ; the value @xmath17 usually used <connector type="CAUSAL"> for </connector> rsgs is <connector type="ADDITIVE"> actually </connector> more appropriate to the surface gravities of red dwarfs or giants.
+there is very little dependence of @xmath14 on effective temperature in this regime.
+this is not surprising, <connector type="CAUSAL"> as </connector> it is well known that @xmath21 is primarily sensitive to surface gravity <connector type="ADVERSATIVE"> rather than </connector> temperature <connector type="CAUSAL"> for </connector> rsgs ; see discussion in massey ( 1998 ).
+stars with higher reddenings require a slightly higher @xmath14 value. <connector type="CONCLUSIVE"> in summary </connector>, <connector type="CAUSAL"> for </connector> stars with @xmath20 between -0.5 <connector type="ADDITIVE"> and </connector> 0.5, @xmath22 between 3400 <connector type="ADDITIVE"> and </connector> 4200 k, <connector type="ADDITIVE"> and </connector> @xmath23, we find @xmath24 <connector type="CAUSAL"> for </connector> a  modestly " reddened rsg, a value of @xmath2 is <connector type="CAUSAL"> thus </connector> appropriate. <connector type="CAUSAL"> as </connector> shown in fig.
+[ fig : avs ], this value <connector type="CAUSAL"> for </connector> @xmath14 now brings the extinction derived from broad - band photometry into accord with that derived from spectrophotometry.
+we were <connector type="TEMPORAL"> initially </connector> concerned about such a large value <connector type="CAUSAL"> for </connector> @xmath14, <connector type="ADVERSATIVE"> but </connector> found that we derive a very similar number using the kurucz ( 1992 ) atlas9 models in place of the marcs models.
+we <connector type="ADDITIVE"> also </connector> find a large @xmath14 value <connector type="TEMPORAL"> when </connector> we <connector type="ADVERSATIVE"> instead </connector> employ the fitzpatrick ( 1999 ) reddening law with the marcs models : @xmath25 with a negligible correction <connector type="CAUSAL"> for </connector> color excess @xmath23.
+the fitzpatrick ( 1999 ) law has slightly lower extinction than ccm89 on the short wavelength side of the @xmath1 filter, <connector type="ADDITIVE"> and </connector> on the long wavelength side of the @xmath0 filter ; the latter is primarily responsible <connector type="CAUSAL"> for </connector> the difference in the derived @xmath14.
+fitzpatrick ( 1999 ) has emphasized the difficulties encountered in deriving a monochromatic law from broad - band photometry, <connector type="ADDITIVE"> and </connector> derived a reddening curve that was very similar to that of ccm89 ; <connector type="ADVERSATIVE"> but </connector> <connector type="CAUSAL"> for </connector> stars of extreme color, <connector type="ADDITIVE"> such as </connector> rsgs, small differences matter. to obtain satisfactory fits to our spectrophotometry using the fitzpatrick (
+
