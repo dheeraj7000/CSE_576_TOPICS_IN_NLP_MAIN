@@ -23,7 +23,7 @@ class Config:
     
     data_dir: str = "data_splits"
     files_per_chunk: int = 5
-    batch_size: int = 16
+    batch_size: int = 128
     train_pattern: str = "train_chunk_*.parquet"
     max_batches_to_print: int = 20
 
