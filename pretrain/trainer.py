@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-trainer.py - FINAL CORRECTED VERSION
+trainer_FIXED.py - FINAL VERSION WITH connector_mask PASSING
 
-CRITICAL CHANGE:
-- REMOVED all connector_mask access from parquet files
-- connector_mask is NOW ONLY created by the collator (on-the-fly)
-- trainer.py NO LONGER tries to extract connector_mask from DirectParquetDataset
-
-This fixes the shape mismatch errors completely!
+CRITICAL FIXES:
+1. ✅ connector_mask extracted from inputs (uncommented)
+2. ✅ connector_mask PASSED to model forward()
+3. ✅ Uses data_loader_FIXED_V3.py for DirectParquetDataset (no duplication)
+4. ✅ Standard cross-entropy loss (Approach 1 - no compounding)
 """
 
 import re
@@ -30,138 +29,11 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Direct Parquet Dataset (CORRECTED - NO connector_mask extraction)
-# ============================================================================
-
-class DirectParquetDataset(HFDataset):
-    """
-    Load preprocessed parquet files directly.
-    
-    CORRECTED: Only extracts input_ids and attention_mask from parquet.
-    connector_mask will be created ON-THE-FLY by the collator.
-    
-    Parquet columns used:
-    - input_ids: tokenized text (REQUIRED)
-    - attention_mask: padding mask (REQUIRED)
-    
-    Parquet columns IGNORED:
-    - connector_mask: (will be created by collator, not extracted from parquet)
-    - connector_words: (metadata only)
-    - connector_types: (metadata only)
-    """
-    
-    def __init__(self, parquet_path: str, max_files: Optional[int] = None):
-        """
-        Initialize dataset from parquet files.
-        
-        Args:
-            parquet_path: Path to parquet file or directory containing parquet files
-            max_files: Limit number of files to load (optional)
-        """
-        self.parquet_path = Path(parquet_path)
-        
-        # Handle both single file and directory
-        if self.parquet_path.is_file():
-            parquet_files = [self.parquet_path]
-        else:
-            parquet_files = sorted(self.parquet_path.glob("*.parquet"))
-        
-        if max_files:
-            parquet_files = parquet_files[:max_files]
-        
-        if not parquet_files:
-            raise FileNotFoundError(f"No parquet files found in {self.parquet_path}")
-        
-        logger.info(f"Found {len(parquet_files)} parquet files")
-        
-        self.data = []
-        for file_path in tqdm(parquet_files, desc="Loading parquet files"):
-            df = pd.read_parquet(file_path)
-            
-            # Validate ONLY required columns
-            required_cols = {'input_ids', 'attention_mask'}
-            actual_cols = set(df.columns)
-            
-            if not required_cols.issubset(actual_cols):
-                logger.warning(f"File {file_path.name} missing columns: {required_cols - actual_cols}")
-                continue
-            
-            # Convert DataFrame to list of dicts
-            self.data.extend(df.to_dict('records'))
-        
-        if not self.data:
-            raise ValueError("No valid data loaded from parquet files")
-        
-        logger.info(f"Loaded {len(self.data):,} samples from parquet")
-        logger.info(f"Sample keys: {list(self.data[0].keys())}")
-        logger.info(f"✓ NOTE: connector_mask will be created ON-THE-FLY by collator")
-        
-        self.total_samples = len(self.data)
-    
-    def __len__(self):
-        return self.total_samples
-    
-    def __getitem__(self, idx):
-        """
-        Get item by index with proper type conversion.
-        
-        CORRECTED: Only returns input_ids and attention_mask.
-        connector_mask is NOT extracted from parquet.
-        """
-        item = self.data[idx]
-        
-        # Helper function to convert string representations to lists
-        def parse_list(value):
-            if isinstance(value, str):
-                try:
-                    return ast.literal_eval(value)
-                except:
-                    return value
-            return value
-        
-        # Extract and convert input_ids
-        input_ids = parse_list(item.get("input_ids", []))
-        if isinstance(input_ids, list):
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-        else:
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-        
-        # Extract and convert attention_mask
-        attention_mask = parse_list(item.get("attention_mask", []))
-        if isinstance(attention_mask, list):
-            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-        else:
-            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-        
-        # ✅ CORRECTED: DO NOT extract connector_mask from parquet!
-        # It will be created by the collator instead.
-        
-        # Build return dictionary (only input_ids and attention_mask)
-        result = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        }
-        
-        # Add metadata for reference (not used in training)
-        result["connector_words"] = parse_list(item.get("connector_words", []))
-        result["connector_types"] = parse_list(item.get("connector_types", []))
-        
-        return result
-    
-    @property
-    def column_names(self):
-        """Return column names for compatibility."""
-        if self.data:
-            return list(self.data[0].keys())
-        return []
-
-
-# ============================================================================
-# Enhanced Connector Annotator (UNCHANGED)
+# Enhanced Connector Annotator
 # ============================================================================
 
 class ConnectorAnnotator:
-    """Annotates text with connector markup using format: word"""
+    """Annotates text with connector markup using format: <connector type="TYPE">word</connector>"""
     
     def __init__(self, connector_types: Dict[str, List[str]]):
         """
@@ -197,7 +69,7 @@ class ConnectorAnnotator:
 
 
 # ============================================================================
-# Fallback Data Collator (UNCHANGED)
+# Fallback Data Collator
 # ============================================================================
 
 class ConnectorAwareDataCollator:
@@ -243,17 +115,17 @@ class ConnectorAwareDataCollator:
 
 
 # ============================================================================
-# Custom Trainer (CORRECTED)
+# Custom Trainer (FIXED)
 # ============================================================================
 
 class ConnectorAwareTrainer(Trainer):
     """
-    CORRECTED: Trainer with standard cross-entropy loss.
+    FIXED: Trainer that passes connector_mask to model.
     
-    KEY CHANGES:
-    1. NO loss weighting (uses standard CE loss)
-    2. connector_mask passed to model for embedding boost ONLY
-    3. Gradient amplification from embedding boost only (not double-amplified)
+    KEY FEATURES:
+    1. ✅ Extracts connector_mask from batch (created by collator)
+    2. ✅ Passes connector_mask to model for embedding boost
+    3. ✅ Uses standard cross-entropy loss (Approach 1 - no compounding)
     """
     
     def _align_special_tokens(self):
@@ -269,33 +141,32 @@ class ConnectorAwareTrainer(Trainer):
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
-        CORRECTED: Compute standard causal LM loss (no weighting).
+        FIXED: Compute loss with connector_mask passed to model.
         
-        CRITICAL CHANGE:
-        - connector_mask is now created by collator (not extracted from parquet)
-        - It's used for embedding boost in model ONLY
-        - NO connector_mask used in loss computation
+        Flow:
+        1. Extract connector_mask from inputs (created by collator)
+        2. Pass connector_mask to model for 1.1× embedding boost
+        3. Compute standard cross-entropy loss (no weighting)
         """
         
-        # ✅ CORRECTED: Get connector_mask from inputs (created by collator)
-        # DO NOT pop it - just get it!
-        # connector_mask = inputs.get("connector_mask", None)
-        
+        # ✅ FIXED: Extract connector_mask from inputs
         labels = inputs.get("labels")
         input_ids = inputs.get("input_ids")
+        connector_mask = inputs.get("connector_mask", None)  # ← UNCOMMENTED!
         
-        # Forward pass (connector_mask used for embedding boost in model)
+        # ✅ FIXED: Forward pass with connector_mask
         logits = model(
-            in_idx=input_ids
+            in_idx=input_ids,
+            connector_mask=connector_mask  # ← NOW PASSED TO MODEL!
         )
         
-        # Standard cross-entropy loss (NO weighting)
+        # Standard cross-entropy loss (Approach 1 - no compounding)
         if labels is not None:
             # Shift for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            # Standard CE loss (NO connector_mask weighting)
+            # Standard CE loss (no weighting)
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
@@ -315,17 +186,18 @@ class ConnectorAwareTrainer(Trainer):
 
 
 # ============================================================================
-# Main Pretraining Manager (CORRECTED)
+# Main Pretraining Manager (FIXED)
 # ============================================================================
 
 class ConnectorPretrainingManager:
     """
-    CORRECTED: Manager for connector-aware pretraining.
+    FIXED: Manager for connector-aware pretraining.
     
-    KEY CHANGES:
-    - connector_mask is created ON-THE-FLY by collator
-    - NO extraction from parquet
-    - Gradient amplification from embedding boost ONLY
+    Features:
+    - Uses data_loader_FIXED_V3.py for DirectParquetDataset
+    - Uses ConnectorDataCollatorWithMaskCreation for on-the-fly mask creation
+    - Passes connector_mask to model correctly
+    - Approach 1: Embedding boost only (no compounding)
     """
     
     def __init__(self, config, model_handler, use_new_collator: bool = True):
@@ -333,7 +205,7 @@ class ConnectorPretrainingManager:
         Args:
             config: Config instance
             model_handler: Model handler (from model.py)
-            use_new_collator: Use new collator (recommended: True)
+            use_new_collator: Use ConnectorDataCollatorWithMaskCreation (recommended: True)
         """
         self.config = config
         self.model_handler = model_handler
@@ -344,15 +216,14 @@ class ConnectorPretrainingManager:
         self.trainer = None
         
         logger.info("\n" + "="*70)
-        logger.info("CONNECTOR PRETRAINING MANAGER (FINAL CORRECTED)")
+        logger.info("CONNECTOR PRETRAINING MANAGER (FINAL FIXED)")
         logger.info("="*70)
         logger.info(f"Model: {config.model_name}")
         logger.info(f"Device: {config.device}")
         logger.info(f"Boost factor: {config.boost_factor}")
-        logger.info(f"Architectural boosting: ENABLED (embedding layer)")
-        logger.info(f"Loss function: STANDARD cross-entropy (NO weighting)")
-        logger.info(f"connector_mask source: COLLATOR (ON-THE-FLY)")
-        logger.info(f"connector_mask from parquet: IGNORED ✓")
+        logger.info(f"Approach: 1 (Embedding boost only - no compounding)")
+        logger.info(f"connector_mask: Created on-the-fly by collator")
+        logger.info(f"Loss: Standard cross-entropy (no weighting)")
         if use_new_collator:
             logger.info(f"Data collator: ConnectorDataCollatorWithMaskCreation")
         else:
@@ -360,11 +231,21 @@ class ConnectorPretrainingManager:
         logger.info("="*70 + "\n")
     
     def _load_dataset_from_parquet(self, parquet_path: str, max_files: Optional[int] = None) -> HFDataset:
-        """Load dataset directly from parquet files."""
+        """
+        Load dataset from parquet using data_loader_FIXED_V3.py
+        """
         logger.info(f"\n[PARQUET] Loading dataset from: {parquet_path}")
-        dataset = DirectParquetDataset(parquet_path, max_files=max_files)
-        logger.info(f"✓ Loaded {len(dataset):,} samples from parquet")
-        return dataset
+        
+        try:
+            # ✅ FIXED: Import from data_loader_FIXED_V3.py (no duplication)
+            from pretrain.data_loader import DirectParquetDataset
+            dataset = DirectParquetDataset(parquet_path, max_files=max_files)
+            logger.info(f"✓ Loaded {len(dataset):,} samples from parquet")
+            return dataset
+        except ImportError as e:
+            logger.error(f"❌ Could not import DirectParquetDataset from data_loader: {e}")
+            logger.error(f"   Make sure data_loader_FIXED_V3.py is in pretrain/ directory")
+            raise
     
     def _load_dataset_from_hf_format(self, dataset_path: str) -> HFDataset:
         """Load dataset from HuggingFace format."""
@@ -388,17 +269,17 @@ class ConnectorPretrainingManager:
         **kwargs
     ):
         """
-        CORRECTED: Prepare trainer with on-the-fly connector_mask creation.
+        Prepare trainer with corrected connector_mask passing.
         """
         logger.info("\n" + "="*70)
-        logger.info("PREPARING TRAINER (FINAL CORRECTED)")
+        logger.info("PREPARING TRAINER (FINAL FIXED)")
         logger.info("="*70)
         
         # Create data collator
         logger.info(f"\n[1/2] Setting up data collator...")
         
         if self.use_new_collator:
-            # USE ConnectorDataCollatorWithMaskCreation from data_loader.py
+            # ✅ FIXED: Import from data_loader_FIXED_V3.py
             try:
                 from pretrain.data_loader import ConnectorDataCollatorWithMaskCreation
                 data_collator = ConnectorDataCollatorWithMaskCreation(
@@ -409,7 +290,8 @@ class ConnectorPretrainingManager:
                 logger.info("✓ Using ConnectorDataCollatorWithMaskCreation")
                 logger.info(f"  - connector_mask created ON-THE-FLY")
                 logger.info(f"  - Scans input_ids for connector tags")
-                logger.info(f"  - Boost values: 1.0 (normal) or {boost_factor}x (connector)")
+                logger.info(f"  - Validates attention_mask for padding")
+                logger.info(f"  - Boost values: 1.0 (normal) or {boost_factor}× (connector)")
             except ImportError as e:
                 logger.error(f"❌ IMPORT ERROR: {e}")
                 logger.warning("⚠ Falling back to original collator...")
@@ -489,20 +371,23 @@ class ConnectorPretrainingManager:
         if eval_dataset:
             logger.info(f"Evaluation samples: {len(eval_dataset):,}")
         
-        logger.info(f"\nConnector Boosting:")
-        logger.info(f"  Location: Embedding layer (ONCE per block)")
-        logger.info(f"  Boost factor: {boost_factor}x")
-        logger.info(f"  Application: Hidden state multiplication")
+        logger.info(f"\nConnector Boosting (Approach 1):")
+        logger.info(f"  Location: Embedding layer ONLY")
+        logger.info(f"  Boost factor: {boost_factor}×")
+        logger.info(f"  Compounding: NO (single boost)")
+        logger.info(f"  Gradient amplification: Indirect (from boosted embeddings)")
         
-        logger.info(f"\nData Structure:")
-        logger.info(f"  Parquet source: input_ids + attention_mask ONLY")
-        logger.info(f"  connector_mask: Created ON-THE-FLY by collator ✓")
-        logger.info(f"  Tag detection: Automatic (scans input_ids)")
+        logger.info(f"\nData Flow:")
+        logger.info(f"  1. Parquet: input_ids + attention_mask")
+        logger.info(f"  2. Collator: Creates connector_mask on-the-fly")
+        logger.info(f"  3. Trainer: Passes connector_mask to model")
+        logger.info(f"  4. Model: Applies 1.1× boost to connector embeddings")
+        logger.info(f"  5. Loss: Standard cross-entropy (no weighting)")
         
         logger.info(f"\nLoss Function:")
-        logger.info(f"  Type: STANDARD cross-entropy")
-        logger.info(f"  Weighting: NONE")
-        logger.info(f"  Gradient amplification: From embedding boost ONLY")
+        logger.info(f"  Type: Standard cross-entropy")
+        logger.info(f"  Weighting: NONE (Approach 1)")
+        logger.info(f"  Effect: Clean, simple, no compounding")
         
         logger.info(f"\nTraining Settings:")
         logger.info(f"  Epochs: {num_epochs}")
@@ -552,11 +437,12 @@ if __name__ == "__main__":
     )
     
     logger.info("="*70)
-    logger.info("Trainer module - FINAL CORRECTED VERSION")
+    logger.info("Trainer module - FINAL FIXED VERSION")
     logger.info("="*70)
-    logger.info("Changes:")
-    logger.info("  ✓ Removed connector_mask extraction from parquet")
-    logger.info("  ✓ connector_mask created ON-THE-FLY by collator")
-    logger.info("  ✓ Standard cross-entropy loss (no weighting)")
-    logger.info("  ✓ Gradient amplification from embedding boost ONLY")
+    logger.info("Fixes:")
+    logger.info("  ✅ connector_mask extraction (uncommented)")
+    logger.info("  ✅ connector_mask passed to model forward()")
+    logger.info("  ✅ Uses data_loader_FIXED_V3.py (no duplication)")
+    logger.info("  ✅ Standard cross-entropy loss (Approach 1)")
+    logger.info("  ✅ Padding validation enabled")
     logger.info("="*70)
