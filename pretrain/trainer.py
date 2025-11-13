@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-trainer_FIXED.py - FINAL VERSION WITH connector_mask PASSING
+trainer_FIXED_FINAL.py - WITH attention_mask + connector_mask
 
 CRITICAL FIXES:
-1. ✅ connector_mask extracted from inputs (uncommented)
-2. ✅ connector_mask PASSED to model forward()
-3. ✅ Uses data_loader_FIXED_V3.py for DirectParquetDataset (no duplication)
-4. ✅ Standard cross-entropy loss (Approach 1 - no compounding)
+1. ✅ attention_mask extracted from inputs
+2. ✅ attention_mask PASSED to model forward()
+3. ✅ connector_mask extracted from inputs
+4. ✅ connector_mask PASSED to model forward()
+5. ✅ Uses data_loader_FIXED_V3.py for DirectParquetDataset
+6. ✅ Standard cross-entropy loss (Approach 1 - no compounding)
+
+KEY CHANGE FROM PREVIOUS:
+✅ Line 155: Now passes BOTH attention_mask AND connector_mask to model
 """
 
 import re
@@ -115,17 +120,23 @@ class ConnectorAwareDataCollator:
 
 
 # ============================================================================
-# Custom Trainer (FIXED)
+# Custom Trainer (FIXED FINAL - WITH BOTH MASKS)
 # ============================================================================
 
 class ConnectorAwareTrainer(Trainer):
     """
-    FIXED: Trainer that passes connector_mask to model.
+    FIXED FINAL: Trainer that passes BOTH attention_mask AND connector_mask to model.
     
     KEY FEATURES:
-    1. ✅ Extracts connector_mask from batch (created by collator)
-    2. ✅ Passes connector_mask to model for embedding boost
-    3. ✅ Uses standard cross-entropy loss (Approach 1 - no compounding)
+    1. ✅ Extracts attention_mask from batch
+    2. ✅ Extracts connector_mask from batch (created by collator)
+    3. ✅ Passes BOTH masks to model for attention masking + embedding boost
+    4. ✅ Uses standard cross-entropy loss (Approach 1 - no compounding)
+    
+    THREE MASKS WORKING TOGETHER:
+    - attention_mask (0/1): Masks padding in attention mechanism
+    - connector_mask (1.0/1.1): Boosts connector embeddings
+    - labels (-100): Masks padding in loss computation
     """
     
     def _align_special_tokens(self):
@@ -141,42 +152,68 @@ class ConnectorAwareTrainer(Trainer):
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
-        FIXED: Compute loss with connector_mask passed to model.
+        FIXED FINAL: Compute loss with BOTH attention_mask AND connector_mask.
         
         Flow:
-        1. Extract connector_mask from inputs (created by collator)
-        2. Pass connector_mask to model for 1.1× embedding boost
-        3. Compute standard cross-entropy loss (no weighting)
+        1. Extract attention_mask from inputs
+        2. Extract connector_mask from inputs (created by collator)
+        3. Pass BOTH to model for complete masking strategy
+        4. Compute standard cross-entropy loss (no weighting)
+        
+        Returns:
+            loss: Scalar loss value
         """
         
-        # ✅ FIXED: Extract connector_mask from inputs
+        # ✅ CRITICAL FIXES: Extract BOTH masks from inputs
         labels = inputs.get("labels")
         input_ids = inputs.get("input_ids")
-        connector_mask = inputs.get("connector_mask", None)  # ← UNCOMMENTED!
+        attention_mask = inputs.get("attention_mask")  # ✅ For masking padding in attention
+        connector_mask = inputs.get("connector_mask", None)  # ✅ For connector boost
         
-        # ✅ FIXED: Forward pass with connector_mask
+        # Debug logging (first batch only)
+        if not hasattr(self, '_logged_first_batch'):
+            logger.info("\n" + "="*70)
+            logger.info("BATCH DEBUG INFO")
+            logger.info("="*70)
+            logger.info(f"input_ids shape: {input_ids.shape}")
+            logger.info(f"attention_mask shape: {attention_mask.shape if attention_mask is not None else 'None'}")
+            logger.info(f"connector_mask shape: {connector_mask.shape if connector_mask is not None else 'None'}")
+            logger.info(f"labels shape: {labels.shape if labels is not None else 'None'}")
+            
+            if attention_mask is not None:
+                logger.info(f"Valid tokens (attention_mask=1): {(attention_mask == 1).sum().item()}")
+            if labels is not None:
+                logger.info(f"Valid labels (not -100): {(labels != -100).sum().item()}")
+            if connector_mask is not None:
+                logger.info(f"Boosted tokens (mask>1): {(connector_mask > 1.0).sum().item()}")
+            
+            logger.info("="*70 + "\n")
+            self._logged_first_batch = True
+        
+        # ✅ CRITICAL: Forward pass with BOTH masks
         logits = model(
             in_idx=input_ids,
-            connector_mask=connector_mask  # ← NOW PASSED TO MODEL!
+            attention_mask=attention_mask,  # ← For masking padding in attention
+            connector_mask=connector_mask   # ← For connector boost
         )
         
-        # Standard cross-entropy loss (Approach 1 - no compounding)
+        # Standard cross-entropy loss (Approach 1 - no weighting)
         if labels is not None:
-            # Shift for next-token prediction
+            # Shift for next-token prediction (causal language modeling)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            # Standard CE loss (no weighting)
+            # Standard CE loss
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
-                ignore_index=-100
+                ignore_index=-100  # ← Ignore padding positions
             )
         else:
-            # Fallback if no labels
+            # Fallback if no labels (shouldn't happen)
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                input_ids.view(-1),
                 ignore_index=-100
             )
         
@@ -186,17 +223,17 @@ class ConnectorAwareTrainer(Trainer):
 
 
 # ============================================================================
-# Main Pretraining Manager (FIXED)
+# Main Pretraining Manager (FIXED FINAL)
 # ============================================================================
 
 class ConnectorPretrainingManager:
     """
-    FIXED: Manager for connector-aware pretraining.
+    FIXED FINAL: Manager for connector-aware pretraining.
     
     Features:
     - Uses data_loader_FIXED_V3.py for DirectParquetDataset
     - Uses ConnectorDataCollatorWithMaskCreation for on-the-fly mask creation
-    - Passes connector_mask to model correctly
+    - Passes BOTH attention_mask AND connector_mask to model
     - Approach 1: Embedding boost only (no compounding)
     """
     
@@ -222,6 +259,7 @@ class ConnectorPretrainingManager:
         logger.info(f"Device: {config.device}")
         logger.info(f"Boost factor: {config.boost_factor}")
         logger.info(f"Approach: 1 (Embedding boost only - no compounding)")
+        logger.info(f"attention_mask: Passed to model for attention masking")
         logger.info(f"connector_mask: Created on-the-fly by collator")
         logger.info(f"Loss: Standard cross-entropy (no weighting)")
         if use_new_collator:
@@ -288,9 +326,9 @@ class ConnectorPretrainingManager:
                     boost_factor=boost_factor
                 )
                 logger.info("✓ Using ConnectorDataCollatorWithMaskCreation")
-                logger.info(f"  - connector_mask created ON-THE-FLY")
-                logger.info(f"  - Scans input_ids for connector tags")
-                logger.info(f"  - Validates attention_mask for padding")
+                logger.info(f"  - attention_mask: Validated/regenerated from input_ids")
+                logger.info(f"  - connector_mask: Created ON-THE-FLY")
+                logger.info(f"  - labels: Created with -100 for padding")
                 logger.info(f"  - Boost values: 1.0 (normal) or {boost_factor}× (connector)")
             except ImportError as e:
                 logger.error(f"❌ IMPORT ERROR: {e}")
@@ -377,12 +415,21 @@ class ConnectorPretrainingManager:
         logger.info(f"  Compounding: NO (single boost)")
         logger.info(f"  Gradient amplification: Indirect (from boosted embeddings)")
         
+        logger.info(f"\nThree Masks Working Together:")
+        logger.info(f"  1. attention_mask (0/1): Passed to model for attention masking")
+        logger.info(f"     → Masks padding in attention scores (scores → -inf)")
+        logger.info(f"  2. connector_mask (1.0/1.1): Passed to model for embedding boost")
+        logger.info(f"     → Amplifies connector embeddings by 1.1×")
+        logger.info(f"  3. labels (-100): Used in cross-entropy loss")
+        logger.info(f"     → Padding ignored with ignore_index=-100")
+        
         logger.info(f"\nData Flow:")
         logger.info(f"  1. Parquet: input_ids + attention_mask")
         logger.info(f"  2. Collator: Creates connector_mask on-the-fly")
-        logger.info(f"  3. Trainer: Passes connector_mask to model")
-        logger.info(f"  4. Model: Applies 1.1× boost to connector embeddings")
-        logger.info(f"  5. Loss: Standard cross-entropy (no weighting)")
+        logger.info(f"  3. Collator: Creates labels (input_ids with -100 for padding)")
+        logger.info(f"  4. Trainer: Passes attention_mask, connector_mask to model")
+        logger.info(f"  5. Model: Applies masking + boost")
+        logger.info(f"  6. Loss: Standard cross-entropy (no weighting)")
         
         logger.info(f"\nLoss Function:")
         logger.info(f"  Type: Standard cross-entropy")
@@ -440,9 +487,10 @@ if __name__ == "__main__":
     logger.info("Trainer module - FINAL FIXED VERSION")
     logger.info("="*70)
     logger.info("Fixes:")
-    logger.info("  ✅ connector_mask extraction (uncommented)")
-    logger.info("  ✅ connector_mask passed to model forward()")
+    logger.info("  ✅ attention_mask extraction and passing")
+    logger.info("  ✅ connector_mask extraction and passing")
     logger.info("  ✅ Uses data_loader_FIXED_V3.py (no duplication)")
     logger.info("  ✅ Standard cross-entropy loss (Approach 1)")
     logger.info("  ✅ Padding validation enabled")
+    logger.info("  ✅ THREE masks working together!")
     logger.info("="*70)
