@@ -4,15 +4,16 @@ from transformers import AutoTokenizer
 from utils.config import Config
 import numpy as np
 
-# --- USER CONFIGURABLE ---
-BATCH_SIZE = 16
-FILES_PER_CHUNK = 5
-DATA_DIR = "data_splits"
-MAX_BATCHES_TO_PRINT = 20
-TOKENIZER_PATH = "./tokenizer_extended"  # <<--- Your saved extended tokenizer!
-
 # --- LOAD CONFIG & TOKENIZER ---
 cfg = Config()
+
+# --- USER CONFIGURABLE ---
+BATCH_SIZE = cfg.batch_size  # ← Use from config!
+FILES_PER_CHUNK = cfg.files_per_chunk
+DATA_DIR = cfg.data_dir
+MAX_BATCHES_TO_PRINT = cfg.max_batches_to_print
+TOKENIZER_PATH = cfg.tokenizer_path
+
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
 
 # Dynamically get tag tokens from config (ALWAYS use the ones used in preprocessing!)
@@ -56,16 +57,20 @@ def token_batch_streamer(files, batch_size, open_tag_ids, close_tag_id, boost, m
             # Amplification logic based on tags from config/tokenizer
             if tid in open_tag_ids:
                 inside_connector = True
-                amp = boost
+                amp = 1.0
+                batch_amps.append(float(amp))
             elif tid == close_tag_id:
-                amp = boost
+                amp = 1.0
+                batch_amps.append(float(amp))
                 inside_connector = False
             else:
                 amp = boost if inside_connector else 1.0
+                batch_amps.append(float(amp))
             batch_tokens.append(int(tid))
-            batch_amps.append(float(amp))
+            # batch_amps.append(float(amp))
             batch_sources.append((fidx+file_pointer, sidx, pos))
             if len(batch_tokens) == batch_size:
+                # print(f"Yielding batch of size: {len(batch_tokens)}")
                 yield batch_tokens[:], batch_amps[:], batch_sources[:]
                 batch_tokens.clear(); batch_amps.clear(); batch_sources.clear()
                 printed_batches += 1

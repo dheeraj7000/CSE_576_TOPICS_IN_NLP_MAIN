@@ -36,21 +36,14 @@ class ConnectorTrainer:
         print(f"Device: {self.device}")
         print(f"{'='*70}\n")
     
+
     def train_epoch(self, epoch_num, batch_streamer):
-        """
-        Train for one epoch using streaming batches.
-        
-        Args:
-            epoch_num: Current epoch number
-            batch_streamer: Generator yielding (tokens, amps, sources)
-        """
+        """Train for one epoch with embedding-level amplification"""
         self.model.train()
         total_loss = 0.0
         batch_count = 0
         
-        print(f"\n{'='*70}")
-        print(f"EPOCH {epoch_num}")
-        print(f"{'='*70}\n")
+        model_dtype = next(self.model.parameters()).dtype
         
         for tokens, amps, sources in tqdm(batch_streamer, desc=f"Epoch {epoch_num}", unit="batch"):
             batch_count += 1
@@ -58,35 +51,49 @@ class ConnectorTrainer:
             # Convert to tensors
             input_ids = torch.tensor(tokens, dtype=torch.long).to(self.device)
             amp_vec = torch.tensor(amps, dtype=torch.float32).to(self.device)
-
-            input_ids, amp_vec = self._prepare_inputs(
-                torch.tensor(tokens, dtype=torch.long),
-                torch.tensor(amps, dtype=torch.float32)
-            )
             
-            # Forward pass
+            # ✅ FIX: Reshape to 2D [1, seq_len] (batch_size=1)
+            input_ids = input_ids.unsqueeze(0)  # [seq_len] → [1, seq_len]
+            amp_vec = amp_vec.unsqueeze(0)      # [seq_len] → [1, seq_len]
+            
+            # Convert amp to model dtype
+            amp_vec = amp_vec.to(dtype=model_dtype)
+            
             self.optimizer.zero_grad()
+
+            # print(f"Tokens from data loader: {len(tokens)}")  # Should print 128, not 16
+            # print(f"Input IDs after unsqueeze: {input_ids.shape}")  # Should be [1, 128]
             
-            # Get embeddings and boost
-            inputs_embeds = self.model.get_input_embeddings()(input_ids)
-            amp_vec_expanded = amp_vec.unsqueeze(-1)
-            inputs_embeds = inputs_embeds * amp_vec_expanded
+            # Get token embeddings
+            embeddings = self.model.get_input_embeddings()(input_ids)
+            # Now embeddings shape: [1, seq_len, 3072] ← CORRECT!
+            
+            # print(f"Input IDs shape: {input_ids.shape}")
+            # print(f"Embedding shape: {embeddings.shape}")  # Should be [1, 128, 3072]
+            
+            # Amplify connector token embeddings
+            amp_vec_expanded = amp_vec.unsqueeze(-1)  # [1, seq_len, 1]
+            amplified_embeddings = embeddings * amp_vec_expanded
             
             # Create labels (shift for next-token prediction)
             labels = input_ids.clone()
-            labels[:-1] = input_ids[1:]
-            labels[-1] = -100
+            labels[0, :-1] = input_ids[0, 1:]  # Shift within batch dimension
+            # labels[0, -1] = -100
+
+            # print(labels)
             
-            # Forward
+            # Create 2D attention_mask
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            
+            # Forward pass
             outputs = self.model(
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=amplified_embeddings,
+                attention_mask=attention_mask,
                 labels=labels,
                 return_dict=True
             )
             
             loss = outputs.loss
-            
-            # Backward
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
@@ -95,22 +102,89 @@ class ConnectorTrainer:
             
             # Print sample batches
             if batch_count <= self.cfg.max_batches_to_print:
-                decoded = self.tokenizer.decode(tokens, skip_special_tokens=False)
+                # Flatten back to 1D for decoding
+                decoded = self.tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=False)
                 print(f"\n--- Batch {batch_count} ---")
                 print(f"Loss: {loss.item():.4f}")
+                print(f"Amplification (mean): {amp_vec.mean().item():.4f}")
                 print(f"Decoded (first 100 chars): {decoded[:100]}...")
                 print(f"Amps (first 10): {amps[:10]}")
         
         avg_loss = total_loss / batch_count if batch_count > 0 else 0
-        print(f"\n{'='*70}")
-        print(f"Epoch {epoch_num} Complete")
-        print(f"Batches processed: {batch_count}")
-        print(f"Average loss: {avg_loss:.4f}")
-        print(f"{'='*70}\n")
-
-        clear_cuda_memory()
+        print(f"\nEpoch {epoch_num} complete - Avg loss: {avg_loss:.4f}\n")
         
         return avg_loss
+
+    # def train_epoch(self, epoch_num, batch_streamer):
+    #     """Train for one epoch with embedding-level amplification"""
+    #     self.model.train()
+    #     total_loss = 0.0
+    #     batch_count = 0
+        
+    #     model_dtype = next(self.model.parameters()).dtype
+        
+    #     for tokens, amps, sources in tqdm(batch_streamer, desc=f"Epoch {epoch_num}", unit="batch"):
+    #         batch_count += 1
+            
+    #         # Convert to tensors
+    #         input_ids = torch.tensor(tokens, dtype=torch.long).to(self.device)
+    #         amp_vec = torch.tensor(amps, dtype=torch.float32).to(self.device)
+            
+    #         # Convert amp to model dtype for amplification
+    #         amp_vec = amp_vec.to(self.device, dtype=model_dtype)
+            
+    #         self.optimizer.zero_grad()
+            
+    #         # ✅ KEY: Get embeddings, amplify them, then forward
+    #         # Get token embeddings
+    #         embeddings = self.model.get_input_embeddings()(input_ids)
+
+    #         print("Embedding DIM:", embeddings.shape)
+            
+    #         # Amplify connector token embeddings
+    #         # amp_vec shape: [batch_size] → expand to [batch_size, 1] for broadcasting
+    #         amp_vec_expanded = amp_vec.unsqueeze(-1)  # [batch_size, 1]
+    #         amplified_embeddings = embeddings * amp_vec_expanded  # [batch_size, hidden_dim]
+            
+    #         # Create labels (shift for next-token prediction)
+    #         labels = input_ids.clone()
+    #         labels[:-1] = input_ids[1:]
+    #         labels[-1] = -100
+
+    #         print(labels)
+            
+    #        # ✅ KEY FIX: Create attention_mask (all 1s = all real tokens, no padding)
+    #         attention_mask = torch.ones(input_ids.shape, dtype=torch.long).to(self.device)
+            
+    #         # Forward pass with AMPLIFIED embeddings + attention_mask
+    #         outputs = self.model(
+    #             inputs_embeds=amplified_embeddings,  # Use amplified embeddings
+    #             attention_mask=attention_mask,       # ← ADD THIS!
+    #             labels=labels,
+    #             return_dict=True
+    #         )
+            
+    #         loss = outputs.loss
+    #         loss.backward()
+    #         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+    #         self.optimizer.step()
+            
+    #         total_loss += loss.item()
+            
+    #         # Print sample batches
+    #         if batch_count <= self.cfg.max_batches_to_print:
+    #             decoded = self.tokenizer.decode(tokens, skip_special_tokens=False)
+    #             print(f"\n--- Batch {batch_count} ---")
+    #             print(f"Loss: {loss.item():.4f}")
+    #             print(f"Amplification (mean): {amp_vec.mean().item():.4f}")
+    #             print(f"Decoded (first 100 chars): {decoded[:100]}...")
+    #             print(f"Amps (first 10): {amps[:10]}")
+        
+    #     avg_loss = total_loss / batch_count if batch_count > 0 else 0
+    #     print(f"\nEpoch {epoch_num} complete - Avg loss: {avg_loss:.4f}\n")
+        
+    #     return avg_loss
+
     
     def save_checkpoint(self, path):
         """Save model checkpoint"""

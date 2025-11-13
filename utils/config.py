@@ -164,7 +164,6 @@ class Config:
     
     # Performance - OPTIMIZED
     num_workers: int = 4
-    batch_size: int = 10000
     dataloader_num_workers: int = 4
     dataloader_pin_memory: bool = True
     dataloader_prefetch_factor: int = 2
