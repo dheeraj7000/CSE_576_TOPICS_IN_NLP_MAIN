@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-model_FIXED.py - WITH CONNECTOR BOOST SUPPORT
+model_FIXED_FINAL.py - WITH ATTENTION_MASK + CONNECTOR_BOOST
 
-Llama 3.2 with connector-aware training.
+CRITICAL FIX:
+✅ forward() NOW accepts BOTH attention_mask AND connector_mask
+✅ attention_mask used in transformer attention (masks padding)
+✅ connector_mask used for connector boost (amplifies embeddings)
+✅ Both masks work together correctly
 
-KEY ARCHITECTURAL CHANGES:
-✅ forward() NOW accepts connector_mask parameter
-✅ Boost applied to embeddings after token_emb
-✅ TransformerBlock ONLY takes: x, mask, cos, sin (unchanged)
-✅ Simple, clean transformer implementation
-
-FIX APPLIED:
-✅ Line ~405: Added connector_mask=None parameter
-✅ Line ~412-414: Added boost application code
+KEY CHANGES FROM PREVIOUS VERSION:
+✅ Line 407: Added attention_mask=None parameter to forward()
+✅ Line 427-430: Pass attention_mask to transformer blocks
+✅ Line 143: Use attention_mask in attention computation
 """
 
 import torch
@@ -89,7 +88,7 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 
 class GroupedQueryAttention(nn.Module):
-    """Grouped Query Attention (GQA)."""
+    """Grouped Query Attention (GQA) with attention mask support."""
     
     def __init__(self, config: dict):
         super().__init__()
@@ -104,7 +103,18 @@ class GroupedQueryAttention(nn.Module):
         self.w_o = nn.Linear(config["emb_dim"], config["emb_dim"], bias=False)
     
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, 
-                cos: Optional[torch.Tensor] = None, sin: Optional[torch.Tensor] = None) -> torch.Tensor:
+                attention_mask: Optional[torch.Tensor] = None,
+                cos: Optional[torch.Tensor] = None, 
+                sin: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward with attention_mask support.
+        
+        Args:
+            x: Input tensor (batch, seq, emb_dim)
+            mask: Causal mask (for autoregressive generation)
+            attention_mask: Padding mask (batch, seq) - 1 for real tokens, 0 for padding
+            cos, sin: RoPE embeddings
+        """
         batch_size, seq_len, emb_dim = x.shape
         
         q = self.w_q(x).view(batch_size, seq_len, self.n_heads, self.head_dim)
@@ -127,17 +137,29 @@ class GroupedQueryAttention(nn.Module):
         
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         
+        # ✅ CRITICAL FIX: Apply attention_mask for padding
+        if attention_mask is not None:
+            # attention_mask: (batch, seq) with 1 for real, 0 for padding
+            # Expand to (batch, 1, 1, seq) for broadcasting
+            padding_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq)
+            # Set padding positions to -inf so they get ~0 attention after softmax
+            scores = scores.masked_fill(padding_mask == 0, float('-inf'))
+        
+        # Apply causal mask (if provided)
         if mask is not None:
-            mask_2d = mask.unsqueeze(1).unsqueeze(1)
             causal_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
                 diagonal=1
             )
             causal_mask = ~causal_mask
-            combined_mask = mask_2d & causal_mask.unsqueeze(0).unsqueeze(0)
+            combined_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             scores = scores.masked_fill(~combined_mask, float('-inf'))
         
         attn = torch.softmax(scores, dim=-1)
+        
+        # Replace NaN (from -inf in all-padding rows) with 0
+        attn = torch.nan_to_num(attn, nan=0.0)
+        
         context = torch.matmul(attn, v)
         context = context.transpose(1, 2).contiguous()
         context = context.view(batch_size, seq_len, emb_dim)
@@ -173,11 +195,10 @@ class RMSNorm(nn.Module):
 
 class TransformerBlock(nn.Module):
     """
-    Transformer block - CLEAN VERSION.
+    Transformer block with attention_mask support.
     
-    ✅ NO connector_mask parameter
-    ✅ Simple transformer: attention → residual → FF → residual
-    ✅ No boost logic here (data_loader handles it)
+    ✅ Accepts attention_mask parameter
+    ✅ Passes it to attention layer
     """
     
     def __init__(self, config: dict):
@@ -187,11 +208,19 @@ class TransformerBlock(nn.Module):
         self.norm_attn = RMSNorm(config["emb_dim"], config["norm_eps"])
         self.norm_ff = RMSNorm(config["emb_dim"], config["norm_eps"])
     
-    def forward(self, x, mask, cos, sin):
-        """Forward pass - NO connector_mask!"""
+    def forward(self, x, mask, attention_mask, cos, sin):
+        """
+        Forward pass with attention_mask.
+        
+        Args:
+            x: Input (batch, seq, emb_dim)
+            mask: Causal mask
+            attention_mask: Padding mask (batch, seq)
+            cos, sin: RoPE embeddings
+        """
         # Attention + residual
         normed = self.norm_attn(x)
-        attn_out = self.attn(normed, mask, cos, sin)
+        attn_out = self.attn(normed, mask, attention_mask, cos, sin)
         x = x + attn_out
         
         # Feed forward + residual
@@ -203,7 +232,7 @@ class TransformerBlock(nn.Module):
 
 
 class Llama3Model(nn.Module):
-    """Llama 3.2 model - with connector boost support."""
+    """Llama 3.2 model with BOTH attention_mask and connector_mask support."""
     
     def __init__(self, config: dict):
         super().__init__()
@@ -257,17 +286,21 @@ class Llama3Model(nn.Module):
         
         return ConfigWrapper(self.config_dict)
     
-    def forward(self, in_idx: torch.Tensor, connector_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, 
+                in_idx: torch.Tensor, 
+                attention_mask: Optional[torch.Tensor] = None,
+                connector_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass - WITH connector_mask support!
+        Forward pass with BOTH masks.
         
-        ✅ Added connector_mask parameter (optional)
-        ✅ Applies boost to embeddings if mask provided
-        ✅ Backward compatible (works without mask too)
+        ✅ CRITICAL: Now accepts attention_mask AND connector_mask
+        ✅ attention_mask: Masks padding in attention (0 for padding, 1 for real)
+        ✅ connector_mask: Boosts connector embeddings (1.0 normal, 1.1 boosted)
         
         Args:
             in_idx: Input token IDs (batch_size, seq_len)
-            connector_mask: Connector boost mask (batch_size, seq_len) with values 1.0 or 1.1
+            attention_mask: Padding mask (batch_size, seq_len) - 1 for real, 0 for padding
+            connector_mask: Connector boost mask (batch_size, seq_len) - 1.0 or 1.1
         
         Returns:
             logits: Model output (batch_size, seq_len, vocab_size)
@@ -277,7 +310,7 @@ class Llama3Model(nn.Module):
         # Get embeddings
         x = self.token_emb(in_idx)  # (batch_size, seq_len, emb_dim)
         
-        # ✅ APPLY CONNECTOR BOOST (NEW CODE)
+        # ✅ APPLY CONNECTOR BOOST (if provided)
         if connector_mask is not None:
             # connector_mask: (batch_size, seq_len) with values 1.0 or 1.1
             # Expand to match embedding dimension: (batch_size, seq_len, 1)
@@ -295,9 +328,9 @@ class Llama3Model(nn.Module):
         ).unsqueeze(0)
         mask = ~mask
         
-        # Apply transformer blocks
+        # ✅ APPLY TRANSFORMER BLOCKS (with attention_mask)
         for block in self.trf_blocks:
-            x = block(x, mask, cos, sin)
+            x = block(x, mask, attention_mask, cos, sin)
         
         # Final normalization and output
         x = self.norm_final(x)
