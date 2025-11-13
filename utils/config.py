@@ -125,7 +125,7 @@ class Config:
     
     # Training Configuration
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 16
+    per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 16
     gradient_accumulation_steps: int = 4
     learning_rate: float = 5e-6
@@ -157,7 +157,7 @@ class Config:
     
     # Performance - OPTIMIZED
     num_workers: int = 4
-    batch_size: int = 10000
+    batch_size: int = 128
     dataloader_num_workers: int = 4
     dataloader_pin_memory: bool = True
     dataloader_prefetch_factor: int = 2
