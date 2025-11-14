@@ -5,6 +5,7 @@ output/
 sol/
 
 check.py
+checkpoints/latest
 
 *.zip
 *.Identifier

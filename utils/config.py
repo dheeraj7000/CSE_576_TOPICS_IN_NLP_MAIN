@@ -152,7 +152,14 @@ class Config:
     min_paper_length: int = 50
     max_paper_length: int = 500000
     checkpoint_dir: str = "./checkpoints"
-    CHECKPOINT_DIR: str = "./checkpoints"
+    CHECKPOINT_DIR: str = "./checkpoints"  # Backwards compatibility
+
+    # Checkpoint frequency (save every N files processed)
+    checkpoint_frequency: int = 20
+
+    # Checkpoint metadata (optional)
+    save_optimizer_state: bool = False  # Set to True to save optimizer state
+    save_full_state: bool = False       # Set to True to save training state
     
     # Logging
     save_text_preview: bool = True
@@ -251,7 +258,13 @@ class Config:
         print(f"\nData Loading:")
         print(f"  Workers: {self.dataloader_num_workers} (parallel)")
         print(f"  Pin memory: {self.dataloader_pin_memory}")
-        
+
+        print(f"\nCheckpoint System:")
+        print(f"  Directory: {self.checkpoint_dir}")
+        print(f"  Frequency: Every {self.checkpoint_frequency} files")
+        print(f"  Save optimizer: {self.save_optimizer_state}")
+        print(f"  Save full state: {self.save_full_state}")
+                
         print("=" * 70 + "\n")
 
 

@@ -55,6 +55,7 @@ def main():
                 # Clear memory before each epoch
                 print_cuda_memory()
                 
+                # print("batch size-----------------------------------", cfg.batch_size)
                 # Create batch streamer for this epoch
                 batch_stream = token_batch_streamer(
                     files=train_files,
