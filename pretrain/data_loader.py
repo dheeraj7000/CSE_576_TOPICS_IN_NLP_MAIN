@@ -28,6 +28,25 @@ BOOST = cfg.boost_factor
 train_files = sorted(glob.glob(f"{DATA_DIR}/train_chunk_*.parquet"))
 
 
+def count_total_batches(files, batch_size):
+    total_tokens = 0
+    
+    for fname in files:
+        df = pd.read_parquet(fname)
+        # Count tokens in each row and sum
+        for row in df.itertuples(index=False):
+            total_tokens += len(row.input_ids)
+    
+    # Calculate number of complete batches
+    num_batches = total_tokens // batch_size
+    
+    # Add one more batch if there are remaining tokens
+    if total_tokens % batch_size > 0:
+        num_batches += 1
+    
+    return num_batches
+
+
 # --- STREAM ONE CHUNK AT A TIME ---
 def stream_tokens_from_files(files, file_callback=None):
     for fidx, fname in enumerate(files):

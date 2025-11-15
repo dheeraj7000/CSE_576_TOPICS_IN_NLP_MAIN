@@ -155,7 +155,7 @@ class Config:
     CHECKPOINT_DIR: str = "./checkpoints"  # Backwards compatibility
 
     # Checkpoint frequency (save every N files processed)
-    checkpoint_frequency: int = 20
+    checkpoint_frequency: int = 5
 
     # Checkpoint metadata (optional)
     save_optimizer_state: bool = False  # Set to True to save optimizer state
