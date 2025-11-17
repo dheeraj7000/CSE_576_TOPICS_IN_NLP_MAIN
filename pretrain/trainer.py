@@ -2,13 +2,8 @@
 """
 pretrain/trainer.py
 
-Training loop manager with chunked batch counting.
-Now includes local git commit + push workflow using metadata for commit messages.
-
-Can also be run standalone to commit and push existing checkpoints:
-    python pretrain/trainer.py
-    python pretrain/trainer.py --checkpoint-dir ./checkpoints
-    python pretrain/trainer.py --message "Custom commit message"
+Training loop manager with ROBUST checkpoint saving, committing, and pushing.
+Handles failures gracefully and provides clear feedback.
 """
 
 import torch
@@ -37,7 +32,7 @@ class ConnectorTrainer:
         self.device = model_wrapper.device
         
         # Hugging Face Hub configuration
-        self.hf_repo_id = hf_repo_id
+        self.hf_repo_id = hf_repo_id or "NeuralNinjasConnector/Connector-Llama"  # Default repo
         self.hf_token = hf_token
         self.hf_api = None
         self.hf_repo = None
@@ -66,8 +61,7 @@ class ConnectorTrainer:
         print(f"Learning rate: {self.optimizer.param_groups[0]['lr']}")
         print(f"Device: {self.device}")
         print(f"Checkpoint directory: {self.checkpoint_dir}")
-        if self.hf_repo_id:
-            print(f"Hugging Face repository: {self.hf_repo_id}")
+        print(f"Hugging Face repository: {self.hf_repo_id}")
         print(f"{'='*70}\n")
     
     def _setup_hf_repo(self):
@@ -177,14 +171,17 @@ class ConnectorTrainer:
         """
         Commit all changes locally and push to Hugging Face Hub.
         Uses metadata file to create detailed commit message.
+        ROBUST with try-except and detailed logging.
         """
+        # Step 1: Check if git repo exists
+        if not (self.checkpoint_dir / ".git").exists():
+            print("⚠️ WARNING: Not a git repository, cannot commit/push")
+            print("   Model saved locally but not pushed to Hugging Face")
+            print("   Run 'python pretrain/trainer.py' later to push manually")
+            return False
+        
+        # Step 2: Generate commit message
         try:
-            # Check if this is a git repo
-            if not (self.checkpoint_dir / ".git").exists():
-                print("⚠️ Not a git repository, skipping commit")
-                return
-            
-            # Load metadata for commit message
             if self.metadata_file.exists():
                 with open(self.metadata_file, "r") as f:
                     meta = json.load(f)
@@ -201,19 +198,33 @@ class ConnectorTrainer:
                 )
             else:
                 commit_msg = f"Checkpoint update - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            print("\n📤 Committing and pushing to Hugging Face Hub...")
-            print(f"Commit message: {commit_msg[:100]}...")
-            
-            # Stage all changes
+        except Exception as e:
+            print(f"⚠️ WARNING: Could not read metadata for commit message: {e}")
+            commit_msg = f"Checkpoint update - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        print("\n" + "="*70)
+        print("📤 COMMITTING AND PUSHING TO HUGGING FACE HUB")
+        print("="*70)
+        print(f"Commit message: {commit_msg[:100]}...")
+        
+        # Step 3: Stage changes
+        try:
+            print("\n[1/3] Staging changes...")
             subprocess.run(
                 ["git", "add", "-A"],
                 cwd=str(self.checkpoint_dir),
                 check=True,
                 capture_output=True
             )
-            
-            # Commit locally
+            print("   ✓ Changes staged successfully")
+        except subprocess.CalledProcessError as e:
+            print(f"   ❌ ERROR staging changes: {e}")
+            print(f"   Model saved locally but not staged")
+            return False
+        
+        # Step 4: Commit locally
+        try:
+            print("\n[2/3] Committing locally...")
             result = subprocess.run(
                 ["git", "commit", "-m", commit_msg],
                 cwd=str(self.checkpoint_dir),
@@ -222,69 +233,114 @@ class ConnectorTrainer:
             )
             
             if result.returncode == 0:
-                print("✓ Committed changes locally")
+                print("   ✓ Changes committed locally")
             elif "nothing to commit" in result.stdout:
-                print("ℹ️ No changes to commit")
-                return
+                print("   ℹ️ No changes to commit (already up to date)")
+                return True
             else:
-                print(f"⚠️ Commit warning: {result.stdout}")
-            
-            # Push to Hugging Face Hub
+                print(f"   ⚠️ Commit warning: {result.stdout}")
+        except subprocess.CalledProcessError as e:
+            print(f"   ❌ ERROR committing: {e}")
+            print(f"   Model saved and staged but not committed")
+            print(f"   You can manually commit later with: cd {self.checkpoint_dir} && git commit -m 'checkpoint'")
+            return False
+        
+        # Step 5: Push to Hugging Face
+        try:
+            print("\n[3/3] Pushing to Hugging Face Hub...")
             subprocess.run(
                 ["git", "push"],
                 cwd=str(self.checkpoint_dir),
                 check=True,
-                capture_output=True
+                capture_output=True,
+                timeout=300  # 5 minute timeout
             )
+            print(f"   ✓ Successfully pushed to {self.hf_repo_id}")
+            print("="*70 + "\n")
+            return True
             
-            print(f"✓ Successfully pushed to {self.hf_repo_id}")
-            
+        except subprocess.TimeoutExpired:
+            print(f"   ❌ ERROR: Push timed out after 5 minutes")
+            print(f"   Model committed locally but not pushed")
+            print(f"   You can manually push later with: cd {self.checkpoint_dir} && git push")
+            return False
         except subprocess.CalledProcessError as e:
-            print(f"❌ Git error: {e}")
-            if e.stdout:
-                print(f"stdout: {e.stdout.decode()}")
+            print(f"   ❌ ERROR pushing to Hugging Face: {e}")
             if e.stderr:
-                print(f"stderr: {e.stderr.decode()}")
-        except Exception as e:
-            print(f"❌ Error during commit/push: {e}")
+                error_msg = e.stderr.decode()
+                print(f"   Error details: {error_msg}")
+                if "Authentication failed" in error_msg:
+                    print(f"   TIP: Run 'huggingface-cli login' to fix authentication")
+                elif "Permission denied" in error_msg:
+                    print(f"   TIP: Check that you have write access to {self.hf_repo_id}")
+            print(f"   Model committed locally but not pushed")
+            print(f"   You can manually push later with: cd {self.checkpoint_dir} && git push")
+            return False
     
     def save_checkpoint(self, files_processed, epoch, total_files, avg_loss, processed_files=None):
-        """Save model checkpoint with metadata and push to HF Hub"""
+        """Save model checkpoint with metadata and ROBUSTLY attempt to commit/push"""
         print(f"\n{'='*70}")
-        print(f"SAVING CHECKPOINT - Files: {files_processed}/{total_files}")
+        print(f"💾 SAVING CHECKPOINT - Files: {files_processed}/{total_files}")
         print(f"{'='*70}")
         
-        # Save model and tokenizer
-        self.model.save_pretrained(self.checkpoint_dir)
-        self.tokenizer.save_pretrained(self.checkpoint_dir)
+        # Step 1: Save model weights (ALWAYS do this)
+        try:
+            print("[1/4] Saving model weights...")
+            self.model.save_pretrained(self.checkpoint_dir)
+            print("   ✓ Model weights saved")
+        except Exception as e:
+            print(f"   ❌ CRITICAL ERROR saving model: {e}")
+            print(f"   {'='*70}\n")
+            return False
         
-        # Save metadata
-        metadata = {
-            "epoch": epoch,
-            "files_processed": files_processed,
-            "total_files": total_files,
-            "last_file_index": files_processed - 1,
-            "avg_loss": avg_loss,
-            "learning_rate": self.optimizer.param_groups[0]['lr'],
-            "model_name": self.cfg.model_name,
-            "processed_files": processed_files or [],
-            "timestamp": datetime.now().isoformat()
-        }
+        # Step 2: Save tokenizer (ALWAYS do this)
+        try:
+            print("[2/4] Saving tokenizer...")
+            self.tokenizer.save_pretrained(self.checkpoint_dir)
+            print("   ✓ Tokenizer saved")
+        except Exception as e:
+            print(f"   ❌ CRITICAL ERROR saving tokenizer: {e}")
+            print(f"   {'='*70}\n")
+            return False
         
-        with open(self.metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        # Step 3: Save metadata (ALWAYS do this)
+        try:
+            print("[3/4] Saving metadata...")
+            metadata = {
+                "epoch": epoch,
+                "files_processed": files_processed,
+                "total_files": total_files,
+                "last_file_index": files_processed - 1,
+                "avg_loss": avg_loss,
+                "learning_rate": self.optimizer.param_groups[0]['lr'],
+                "model_name": self.cfg.model_name,
+                "processed_files": processed_files or [],
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            with open(self.metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print("   ✓ Metadata saved")
+            print(f"      - Epoch: {epoch}")
+            print(f"      - Files processed: {files_processed}")
+            print(f"      - Average loss: {avg_loss:.4f}")
+        except Exception as e:
+            print(f"   ⚠️ WARNING: Could not save metadata: {e}")
         
-        print(f"✓ Model saved to: {self.checkpoint_dir}")
-        print(f"✓ Metadata saved")
-        print(f"  - Epoch: {epoch}")
-        print(f"  - Files processed: {files_processed}")
-        print(f"  - Average loss: {avg_loss:.4f}")
-        
-        # Commit and push to HF Hub (if configured)
+        # Step 4: Commit and push (TRY, but don't fail if this doesn't work)
         if self.hf_repo:
-            self._commit_and_push_to_hf()
+            print("[4/4] Committing and pushing to Hugging Face Hub...")
+            push_success = self._commit_and_push_to_hf()
+            if not push_success:
+                print("\n⚠️ WARNING: Model saved locally but not pushed to Hugging Face")
+                print(f"   Local checkpoint: {self.checkpoint_dir}")
+                print(f"   To push later, run: python pretrain/trainer.py")
+        else:
+            print("[4/4] Skipping commit/push (no HF repo configured)")
         
         print(f"{'='*70}\n")
+        return True
     
     def load_checkpoint(self):
         """Load checkpoint from HF repository"""
@@ -331,7 +387,7 @@ class ConnectorTrainer:
         processed_file_names = []
         model_dtype = next(self.model.parameters()).dtype
         
-        checkpoint_frequency = getattr(self.cfg, 'checkpoint_frequency', 20)
+        checkpoint_frequency = getattr(self.cfg, 'checkpoint_frequency', 5)  # Default to 5 files
         
         # Process files in chunks
         file_pointer = 0
@@ -443,6 +499,7 @@ class ConnectorTrainer:
                         if isinstance(fname, str):
                             processed_file_names.append(Path(fname).name)
                         
+                        # CHECKPOINT EVERY N FILES
                         if files_processed % checkpoint_frequency == 0:
                             avg_loss = total_loss / global_batch_count if global_batch_count > 0 else 0
                             pbar.close()
@@ -481,6 +538,7 @@ class ConnectorTrainer:
         print(f"Average loss: {avg_loss:.4f}")
         print(f"{'='*70}\n")
         
+        # Final checkpoint at end of epoch
         self.save_checkpoint(
             files_processed=files_processed + start_file_idx,
             epoch=epoch_num,
@@ -490,143 +548,3 @@ class ConnectorTrainer:
         )
         
         return avg_loss
-
-
-# ============================================================================
-# STANDALONE MODE: Commit and push checkpoint without training
-# ============================================================================
-
-def commit_and_push_standalone(checkpoint_dir, custom_message=None):
-    """
-    Standalone function to commit and push checkpoint changes.
-    Used when trainer.py is run directly.
-    """
-    checkpoint_dir = Path(checkpoint_dir)
-    metadata_file = checkpoint_dir / "training_metadata.json"
-    
-    if not checkpoint_dir.exists():
-        print(f"❌ Error: Checkpoint directory not found: {checkpoint_dir}")
-        return False
-    
-    if not (checkpoint_dir / ".git").exists():
-        print(f"❌ Error: {checkpoint_dir} is not a git repository")
-        print("Initialize it first with: git clone https://huggingface.co/<username>/<repo>")
-        return False
-    
-    print(f"\n{'='*70}")
-    print("COMMIT AND PUSH CHECKPOINT TO HUGGING FACE HUB")
-    print(f"{'='*70}")
-    print(f"Directory: {checkpoint_dir}")
-    
-    # Generate commit message
-    if custom_message:
-        commit_msg = custom_message
-    elif metadata_file.exists():
-        try:
-            with open(metadata_file, "r") as f:
-                meta = json.load(f)
-            
-            processed_files = meta.get("processed_files", [])
-            files_str = ", ".join(processed_files[-5:]) if processed_files else "N/A"
-            
-            commit_msg = (
-                f"Checkpoint: {meta.get('files_processed', 'N/A')} files | "
-                f"Epoch {meta.get('epoch', 'N/A')} | "
-                f"Loss: {meta.get('avg_loss', 0):.4f} | "
-                f"Recent: {files_str} | "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            print(f"✓ Using metadata for commit message")
-        except Exception as e:
-            print(f"⚠️ Could not read metadata: {e}")
-            commit_msg = f"Checkpoint update - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    else:
-        commit_msg = f"Checkpoint update - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        print(f"ℹ️ No metadata file found, using default message")
-    
-    print(f"Commit message: {commit_msg[:100]}...")
-    
-    try:
-        # Check for changes
-        status_result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(checkpoint_dir),
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        if not status_result.stdout.strip():
-            print("\nℹ️ No changes to commit")
-            print("✓ Checkpoint is already up to date")
-            return True
-        
-        print(f"\n📝 Changes detected:")
-        for line in status_result.stdout.strip().split('\n')[:10]:
-            print(f"  {line}")
-        
-        # Stage changes
-        print("\n📦 Staging changes...")
-        subprocess.run(["git", "add", "-A"], cwd=str(checkpoint_dir), check=True, capture_output=True)
-        print("✓ Changes staged")
-        
-        # Commit locally
-        print("\n💾 Committing locally...")
-        subprocess.run(["git", "commit", "-m", commit_msg], cwd=str(checkpoint_dir), check=True, capture_output=True)
-        print("✓ Changes committed locally")
-        
-        # Push to Hugging Face Hub
-        print("\n📤 Pushing to Hugging Face Hub...")
-        subprocess.run(["git", "push"], cwd=str(checkpoint_dir), check=True, capture_output=True)
-        print("✓ Successfully pushed to Hugging Face Hub")
-        
-        print(f"\n{'='*70}")
-        print("✓ CHECKPOINT SYNC COMPLETE")
-        print(f"{'='*70}\n")
-        
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        print(f"\n❌ Git error: {e}")
-        if e.stdout:
-            print(f"stdout: {e.stdout.decode()}")
-        if e.stderr:
-            print(f"stderr: {e.stderr.decode()}")
-        return False
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        return False
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description='Commit and push checkpoint to Hugging Face Hub (standalone mode)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python pretrain/trainer.py
-  python pretrain/trainer.py --checkpoint-dir ./checkpoints
-  python pretrain/trainer.py --message "Updated model weights"
-        """
-    )
-    
-    parser.add_argument(
-        '--checkpoint-dir',
-        type=str,
-        default='./checkpoints',
-        help='Path to checkpoint directory (default: ./checkpoints)'
-    )
-    
-    parser.add_argument(
-        '--message', '-m',
-        type=str,
-        default=None,
-        help='Custom commit message (otherwise uses metadata)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Run commit and push in standalone mode
-    success = commit_and_push_standalone(args.checkpoint_dir, args.message)
-    
-    sys.exit(0 if success else 1)

@@ -22,7 +22,7 @@ class Config:
     torch_dtype: str = "bfloat16"
     
     data_dir: str = "data_splits"
-    files_per_chunk: int = 5
+    files_per_chunk: int = 1
     batch_size: int = 128
     train_pattern: str = "train_chunk_*.parquet"
     max_batches_to_print: int = 20
@@ -155,7 +155,7 @@ class Config:
     CHECKPOINT_DIR: str = "./checkpoints"  # Backwards compatibility
 
     # Checkpoint frequency (save every N files processed)
-    checkpoint_frequency: int = 5
+    checkpoint_frequency: int = 1
 
     # Checkpoint metadata (optional)
     save_optimizer_state: bool = False  # Set to True to save optimizer state
