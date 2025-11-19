@@ -18,7 +18,8 @@ import subprocess
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from huggingface_hub import HfApi, create_repo, login, Repository
+# Using HfApi for robust uploads instead of fragile git subprocesses
+from huggingface_hub import HfApi, create_repo, login
 from utils.clear_memory import clear_cuda_memory, print_cuda_memory
 
 
@@ -32,16 +33,15 @@ class ConnectorTrainer:
         self.device = model_wrapper.device
         
         # Hugging Face Hub configuration
-        self.hf_repo_id = hf_repo_id or "NeuralNinjasConnector/Connector-Llama"  # Default repo
+        self.hf_repo_id = hf_repo_id or "NeuralNinjasConnector/Connector-Llama"
         self.hf_token = hf_token
         self.hf_api = None
-        self.hf_repo = None
         
         # Checkpoint directory
         self.checkpoint_dir = Path(cfg.checkpoint_dir)
         self.metadata_file = self.checkpoint_dir / "training_metadata.json"
         
-        # Initialize HF repository if configured
+        # Initialize HF API
         if self.hf_repo_id and self.hf_token:
             self._setup_hf_repo()
         else:
@@ -65,11 +65,13 @@ class ConnectorTrainer:
         print(f"{'='*70}\n")
     
     def _setup_hf_repo(self):
-        """Initialize Hugging Face repository as the checkpoint folder"""
+        """Initialize Hugging Face API and ensure repo exists"""
         try:
+            # Login to HF
             login(token=self.hf_token, add_to_git_credential=True)
             self.hf_api = HfApi()
             
+            # Create repo if it doesn't exist
             try:
                 create_repo(
                     repo_id=self.hf_repo_id,
@@ -80,58 +82,15 @@ class ConnectorTrainer:
                 )
                 print(f"✓ Hugging Face repository ready: {self.hf_repo_id}")
             except Exception as e:
-                print(f"ℹ️ Repository may already exist: {e}")
+                print(f"ℹ️ Repository check: {e}")
             
-            if self.checkpoint_dir.exists():
-                if (self.checkpoint_dir / ".git").exists():
-                    print(f"✓ Found existing git repository at {self.checkpoint_dir}")
-                    try:
-                        subprocess.run(["git", "pull"], cwd=str(self.checkpoint_dir), check=True, capture_output=True)
-                        print("✓ Pulled latest changes from HF Hub")
-                    except subprocess.CalledProcessError as e:
-                        print(f"⚠️ Could not pull changes: {e}")
-                else:
-                    self._clone_or_init_repo()
-            else:
-                self._clone_or_init_repo()
-            
-            self.hf_repo = Repository(
-                local_dir=str(self.checkpoint_dir),
-                clone_from=self.hf_repo_id,
-                token=self.hf_token,
-                git_user="training-bot",
-                git_email="training@huggingface.co"
-            )
-            print(f"✓ HF Repository initialized")
+            # Ensure local directory exists
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             
         except Exception as e:
-            print(f"❌ Error setting up Hugging Face repository: {e}")
-            self.hf_repo = None
+            print(f"❌ Error setting up Hugging Face API: {e}")
+            self.hf_api = None
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    def _clone_or_init_repo(self):
-        """Clone HF repository or initialize new one"""
-        try:
-            print(f"📥 Cloning repository from HF Hub")
-            if self.checkpoint_dir.exists() and not (self.checkpoint_dir / ".git").exists():
-                import shutil
-                shutil.rmtree(self.checkpoint_dir)
-            
-            Repository(
-                local_dir=str(self.checkpoint_dir),
-                clone_from=self.hf_repo_id,
-                token=self.hf_token,
-                git_user="training-bot",
-                git_email="training@huggingface.co"
-            )
-            print(f"✓ Successfully cloned repository")
-        except Exception as e:
-            print(f"ℹ️ Could not clone: {e}")
-            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "init"], cwd=str(self.checkpoint_dir), check=True)
-            repo_url = f"https://huggingface.co/{self.hf_repo_id}"
-            subprocess.run(["git", "remote", "add", "origin", repo_url], cwd=str(self.checkpoint_dir), check=False)
-            print(f"✓ Initialized new git repository")
     
     def _count_batches_in_chunk(self, files, batch_size):
         """Count total batches in a chunk of files (e.g., 5 files)."""
@@ -169,141 +128,74 @@ class ConnectorTrainer:
     
     def _commit_and_push_to_hf(self):
         """
-        Commit all changes locally and push to Hugging Face Hub.
-        Uses metadata file to create detailed commit message.
-        ROBUST with try-except and detailed logging.
+        Upload checkpoint directly using HfApi.
+        This is significantly more robust than shelling out to git commands.
         """
-        # Step 1: Check if git repo exists
-        if not (self.checkpoint_dir / ".git").exists():
-            print("⚠️ WARNING: Not a git repository, cannot commit/push")
-            print("   Model saved locally but not pushed to Hugging Face")
-            print("   Run 'python pretrain/trainer.py' later to push manually")
+        if not self.hf_api:
+            print("⚠️ HfApi not initialized, skipping upload")
             return False
-        
-        # Step 2: Generate commit message
+
+        # Generate commit message
         try:
+            commit_msg = f"Checkpoint update - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             if self.metadata_file.exists():
                 with open(self.metadata_file, "r") as f:
                     meta = json.load(f)
-                
-                processed_files = meta.get("processed_files", [])
-                files_str = ", ".join(processed_files[-5:]) if processed_files else "N/A"
-                
                 commit_msg = (
-                    f"Checkpoint: {meta.get('files_processed', 'N/A')} files | "
-                    f"Epoch {meta.get('epoch', 'N/A')} | "
-                    f"Loss: {meta.get('avg_loss', 0):.4f} | "
-                    f"Recent: {files_str} | "
-                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"Epoch {meta.get('epoch', '?')} | "
+                    f"Files {meta.get('files_processed', '?')} | "
+                    f"Loss {meta.get('avg_loss', 0):.4f}"
                 )
-            else:
-                commit_msg = f"Checkpoint update - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         except Exception as e:
-            print(f"⚠️ WARNING: Could not read metadata for commit message: {e}")
-            commit_msg = f"Checkpoint update - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        
+            print(f"⚠️ Could not read metadata for commit msg: {e}")
+
         print("\n" + "="*70)
-        print("📤 COMMITTING AND PUSHING TO HUGGING FACE HUB")
+        print("📤 UPLOADING TO HUGGING FACE HUB")
         print("="*70)
-        print(f"Commit message: {commit_msg[:100]}...")
         
-        # Step 3: Stage changes
         try:
-            print("\n[1/3] Staging changes...")
-            subprocess.run(
-                ["git", "add", "-A"],
-                cwd=str(self.checkpoint_dir),
-                check=True,
-                capture_output=True
+            self.hf_api.upload_folder(
+                folder_path=str(self.checkpoint_dir),
+                repo_id=self.hf_repo_id,
+                repo_type="model",
+                commit_message=commit_msg,
+                ignore_patterns=[".git", ".git/*", "__pycache__", "*.pyc"],
+                token=self.hf_token
             )
-            print("   ✓ Changes staged successfully")
-        except subprocess.CalledProcessError as e:
-            print(f"   ❌ ERROR staging changes: {e}")
-            print(f"   Model saved locally but not staged")
-            return False
-        
-        # Step 4: Commit locally
-        try:
-            print("\n[2/3] Committing locally...")
-            result = subprocess.run(
-                ["git", "commit", "-m", commit_msg],
-                cwd=str(self.checkpoint_dir),
-                capture_output=True,
-                text=True
-            )
-            
-            if result.returncode == 0:
-                print("   ✓ Changes committed locally")
-            elif "nothing to commit" in result.stdout:
-                print("   ℹ️ No changes to commit (already up to date)")
-                return True
-            else:
-                print(f"   ⚠️ Commit warning: {result.stdout}")
-        except subprocess.CalledProcessError as e:
-            print(f"   ❌ ERROR committing: {e}")
-            print(f"   Model saved and staged but not committed")
-            print(f"   You can manually commit later with: cd {self.checkpoint_dir} && git commit -m 'checkpoint'")
-            return False
-        
-        # Step 5: Push to Hugging Face
-        try:
-            print("\n[3/3] Pushing to Hugging Face Hub...")
-            subprocess.run(
-                ["git", "push"],
-                cwd=str(self.checkpoint_dir),
-                check=True,
-                capture_output=True,
-                timeout=300  # 5 minute timeout
-            )
-            print(f"   ✓ Successfully pushed to {self.hf_repo_id}")
+            print(f"✓ Successfully uploaded to {self.hf_repo_id}")
             print("="*70 + "\n")
             return True
             
-        except subprocess.TimeoutExpired:
-            print(f"   ❌ ERROR: Push timed out after 5 minutes")
-            print(f"   Model committed locally but not pushed")
-            print(f"   You can manually push later with: cd {self.checkpoint_dir} && git push")
-            return False
-        except subprocess.CalledProcessError as e:
-            print(f"   ❌ ERROR pushing to Hugging Face: {e}")
-            if e.stderr:
-                error_msg = e.stderr.decode()
-                print(f"   Error details: {error_msg}")
-                if "Authentication failed" in error_msg:
-                    print(f"   TIP: Run 'huggingface-cli login' to fix authentication")
-                elif "Permission denied" in error_msg:
-                    print(f"   TIP: Check that you have write access to {self.hf_repo_id}")
-            print(f"   Model committed locally but not pushed")
-            print(f"   You can manually push later with: cd {self.checkpoint_dir} && git push")
+        except Exception as e:
+            print(f"❌ ERROR uploading to Hugging Face: {e}")
+            print(f"   Model saved locally at: {self.checkpoint_dir}")
             return False
     
     def save_checkpoint(self, files_processed, epoch, total_files, avg_loss, processed_files=None):
-        """Save model checkpoint with metadata and ROBUSTLY attempt to commit/push"""
+        """Save model checkpoint with metadata and attempt upload"""
         print(f"\n{'='*70}")
         print(f"💾 SAVING CHECKPOINT - Files: {files_processed}/{total_files}")
         print(f"{'='*70}")
         
-        # Step 1: Save model weights (ALWAYS do this)
+        # Step 1: Save model weights
         try:
             print("[1/4] Saving model weights...")
             self.model.save_pretrained(self.checkpoint_dir)
             print("   ✓ Model weights saved")
         except Exception as e:
             print(f"   ❌ CRITICAL ERROR saving model: {e}")
-            print(f"   {'='*70}\n")
             return False
         
-        # Step 2: Save tokenizer (ALWAYS do this)
+        # Step 2: Save tokenizer
         try:
             print("[2/4] Saving tokenizer...")
             self.tokenizer.save_pretrained(self.checkpoint_dir)
             print("   ✓ Tokenizer saved")
         except Exception as e:
             print(f"   ❌ CRITICAL ERROR saving tokenizer: {e}")
-            print(f"   {'='*70}\n")
             return False
         
-        # Step 3: Save metadata (ALWAYS do this)
+        # Step 3: Save metadata
         try:
             print("[3/4] Saving metadata...")
             metadata = {
@@ -320,43 +212,22 @@ class ConnectorTrainer:
             
             with open(self.metadata_file, 'w') as f:
                 json.dump(metadata, f, indent=2)
-            
             print("   ✓ Metadata saved")
-            print(f"      - Epoch: {epoch}")
-            print(f"      - Files processed: {files_processed}")
-            print(f"      - Average loss: {avg_loss:.4f}")
         except Exception as e:
             print(f"   ⚠️ WARNING: Could not save metadata: {e}")
         
-        # Step 4: Commit and push (TRY, but don't fail if this doesn't work)
-        if self.hf_repo:
-            print("[4/4] Committing and pushing to Hugging Face Hub...")
-            push_success = self._commit_and_push_to_hf()
-            if not push_success:
-                print("\n⚠️ WARNING: Model saved locally but not pushed to Hugging Face")
-                print(f"   Local checkpoint: {self.checkpoint_dir}")
-                print(f"   To push later, run: python pretrain/trainer.py")
+        # Step 4: Upload to Hub
+        if self.hf_api:
+            print("[4/4] Uploading to Hugging Face Hub...")
+            self._commit_and_push_to_hf()
         else:
-            print("[4/4] Skipping commit/push (no HF repo configured)")
+            print("[4/4] Skipping upload (API not initialized)")
         
         print(f"{'='*70}\n")
         return True
     
     def load_checkpoint(self):
-        """Load checkpoint from HF repository"""
-        if self.hf_repo:
-            try:
-                print(f"\n📥 Pulling latest checkpoint from HF Hub...")
-                subprocess.run(
-                    ["git", "pull"],
-                    cwd=str(self.checkpoint_dir),
-                    check=True,
-                    capture_output=True
-                )
-                print("✓ Successfully pulled latest checkpoint")
-            except Exception as e:
-                print(f"⚠️ Could not pull from HF Hub: {e}")
-        
+        """Load checkpoint metadata from local disk"""
         if self.metadata_file.exists():
             with open(self.metadata_file, 'r') as f:
                 metadata = json.load(f)
@@ -364,7 +235,7 @@ class ConnectorTrainer:
             print(f"\n{'='*70}")
             print("LOADING CHECKPOINT")
             print(f"{'='*70}")
-            print(f"✓ Found checkpoint at: {self.checkpoint_dir}")
+            print(f"✓ Found local checkpoint at: {self.checkpoint_dir}")
             print(f"  - Epoch: {metadata['epoch']}")
             print(f"  - Files processed: {metadata['files_processed']}")
             print(f"  - Last loss: {metadata.get('avg_loss', 'N/A')}")
@@ -372,6 +243,7 @@ class ConnectorTrainer:
             
             return metadata
         
+        print(f"ℹ️ No local checkpoint metadata found at {self.metadata_file}")
         return None
     
     def train_epoch_chunked(self, epoch_num, all_train_files, files_per_chunk, batch_size, 
@@ -387,7 +259,7 @@ class ConnectorTrainer:
         processed_file_names = []
         model_dtype = next(self.model.parameters()).dtype
         
-        checkpoint_frequency = getattr(self.cfg, 'checkpoint_frequency', 5)  # Default to 5 files
+        checkpoint_frequency = getattr(self.cfg, 'checkpoint_frequency', 5)
         
         # Process files in chunks
         file_pointer = 0
@@ -491,7 +363,9 @@ class ConnectorTrainer:
                 })
                 
                 if sources and len(sources) > 0:
-                    current_file = sources[0][0] + file_pointer
+                    # FIX: Add start_file_idx offset to properly calculate global index
+                    # This fixes the issue where resume logic sees "file 0" instead of "file N"
+                    current_file = sources[0][0] + file_pointer + start_file_idx
                     
                     if current_file > files_processed:
                         files_processed = current_file
@@ -502,26 +376,50 @@ class ConnectorTrainer:
                         # CHECKPOINT EVERY N FILES
                         if files_processed % checkpoint_frequency == 0:
                             avg_loss = total_loss / global_batch_count if global_batch_count > 0 else 0
-                            pbar.close()
+                            # Temporarily clear bar to print status
                             
                             self.save_checkpoint(
-                                files_processed=files_processed + start_file_idx,
+                                files_processed=files_processed,
                                 epoch=epoch_num,
-                                total_files=files_to_process or (files_processed + start_file_idx),
+                                total_files=files_to_process or (files_processed),
                                 avg_loss=avg_loss,
                                 processed_files=processed_file_names[-checkpoint_frequency:]
                             )
                             
-                            pbar = tqdm(
-                                desc=f"Epoch {epoch_num} | Chunk {chunk_number}/{total_chunks} | {current_file_name}",
-                                unit="batch",
-                                total=chunk_batches,
-                                initial=chunk_batch_count,
-                                ncols=120,
-                                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+                            # Refresh bar
+                            pbar.set_description(
+                                f"Epoch {epoch_num} | Chunk {chunk_number}/{total_chunks} | {current_file_name}"
                             )
             
             pbar.close()
+            
+            # --- NEW: Force update after chunk completes ---
+            # This catches single-file chunks that didn't trigger the inside-loop check
+            current_chunk_end_global = file_pointer + len(chunk_files) + start_file_idx
+            
+            if current_chunk_end_global > files_processed:
+                # Identify which files we just finished
+                files_just_finished_count = current_chunk_end_global - files_processed
+                
+                # Add names of these files to processed list
+                # We map from global index back to chunk_files index
+                for g_idx in range(files_processed + 1, current_chunk_end_global + 1):
+                    chunk_idx = g_idx - start_file_idx - file_pointer
+                    if 0 <= chunk_idx < len(chunk_files):
+                        fname = chunk_files[chunk_idx - 1] # 0-based
+                        processed_file_names.append(Path(fname).name)
+                
+                files_processed = current_chunk_end_global
+                
+                if files_processed % checkpoint_frequency == 0:
+                    avg_loss = total_loss / global_batch_count if global_batch_count > 0 else 0
+                    self.save_checkpoint(
+                        files_processed=files_processed,
+                        epoch=epoch_num,
+                        total_files=files_to_process or (files_processed),
+                        avg_loss=avg_loss,
+                        processed_files=processed_file_names[-checkpoint_frequency:]
+                    )
             
             print(f"\n✓ Chunk {chunk_number}/{total_chunks} complete!")
             print(f"  Batches processed: {chunk_batch_count}")
@@ -540,9 +438,9 @@ class ConnectorTrainer:
         
         # Final checkpoint at end of epoch
         self.save_checkpoint(
-            files_processed=files_processed + start_file_idx,
+            files_processed=files_processed,
             epoch=epoch_num,
-            total_files=files_to_process or (files_processed + start_file_idx),
+            total_files=files_to_process or (files_processed),
             avg_loss=avg_loss,
             processed_files=processed_file_names
         )
