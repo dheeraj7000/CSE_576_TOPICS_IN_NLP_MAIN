@@ -15,13 +15,15 @@ from utils.config import Config
 from pretrain.model import ConnectorAwareModel
 from pretrain.trainer import ConnectorTrainer
 from utils.clear_memory import clear_cuda_memory, print_cuda_memory
+# FIX: Import snapshot_download to avoid git-lfs requirements
+from huggingface_hub import HfApi, create_repo, snapshot_download
 
 
 def setup_checkpoint_repository(checkpoint_dir, hf_repo_id, hf_token):
-    """Setup checkpoint directory as HF repository"""
-    from huggingface_hub import HfApi, create_repo, Repository
-    import subprocess
-    
+    """
+    Download checkpoint files using snapshot_download.
+    This is safer than 'git clone' because it doesn't require git-lfs.
+    """
     checkpoint_path = Path(checkpoint_dir)
     
     print("\n" + "="*70)
@@ -29,43 +31,28 @@ def setup_checkpoint_repository(checkpoint_dir, hf_repo_id, hf_token):
     print("="*70)
     
     try:
-        api = HfApi()
+        # Ensure the repo exists on the Hub
+        create_repo(repo_id=hf_repo_id, token=hf_token, exist_ok=True, private=False, repo_type="model")
+        print(f"✓ HF repository confirmed: {hf_repo_id}")
+        
+        # Download the files (Robust method)
+        print(f"\n📥 Downloading existing checkpoint files...")
         try:
-            create_repo(repo_id=hf_repo_id, token=hf_token, exist_ok=True, private=False, repo_type="model")
-            print(f"✓ HF repository ready: {hf_repo_id}")
-        except Exception as e:
-            print(f"ℹ️ Repository may already exist: {e}")
-        
-        if not checkpoint_path.exists():
-            print(f"\n📥 Cloning from HF Hub: {hf_repo_id}")
-            try:
-                Repository(local_dir=str(checkpoint_path), clone_from=hf_repo_id, token=hf_token,
-                          git_user="training-bot", git_email="training@huggingface.co")
-                print(f"✓ Successfully cloned")
-                return True
-            except Exception as e:
-                print(f"ℹ️ Clone failed: {e}")
-                checkpoint_path.mkdir(parents=True, exist_ok=True)
-                subprocess.run(["git", "init"], cwd=str(checkpoint_path), check=True)
-                repo_url = f"https://huggingface.co/{hf_repo_id}"
-                subprocess.run(["git", "remote", "add", "origin", repo_url], cwd=str(checkpoint_path), check=False)
-                print(f"✓ Initialized new repository")
-                return True
-        
-        elif not (checkpoint_path / ".git").exists():
-            print(f"\n⚠️ Initializing git repository")
-            subprocess.run(["git", "init"], cwd=str(checkpoint_path), check=True)
-            repo_url = f"https://huggingface.co/{hf_repo_id}"
-            subprocess.run(["git", "remote", "add", "origin", repo_url], cwd=str(checkpoint_path), check=False)
-            print(f"✓ Repository initialized")
+            snapshot_download(
+                repo_id=hf_repo_id,
+                local_dir=str(checkpoint_path),
+                token=hf_token,
+                ignore_patterns=[".git", ".git/*"] # Don't need git internals
+            )
+            print(f"✓ Successfully downloaded checkpoint files")
             return True
-        else:
-            print(f"\n✓ Found existing git repository")
-            subprocess.run(["git", "pull"], cwd=str(checkpoint_path), capture_output=True)
+        except Exception as e:
+            print(f"ℹ️ Download warning (might be empty repo): {e}")
+            checkpoint_path.mkdir(parents=True, exist_ok=True)
             return True
     
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ Error setting up repo: {e}")
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         return False
     finally:
@@ -101,7 +88,7 @@ def main():
         
         print_cuda_memory()
         
-        # Setup checkpoint repository
+        # Setup checkpoint repository (Download existing files)
         if args.hf_repo_id and args.hf_token:
             setup_checkpoint_repository(cfg.checkpoint_dir, args.hf_repo_id, args.hf_token)
         
@@ -115,36 +102,29 @@ def main():
             print("RESUME TRAINING MODE")
             print("="*70)
             
-            checkpoint_path = Path(cfg.checkpoint_dir)
+            # Initialize temporary trainer to load metadata
+            temp_model = ConnectorAwareModel(cfg)
+            temp_trainer = ConnectorTrainer(temp_model, cfg, hf_repo_id=args.hf_repo_id, hf_token=args.hf_token)
             
-            if not checkpoint_path.exists() and args.hf_repo_id and args.hf_token:
-                setup_checkpoint_repository(cfg.checkpoint_dir, args.hf_repo_id, args.hf_token)
+            # Load the metadata we just downloaded
+            metadata = temp_trainer.load_checkpoint()
             
-            if args.resume_training:
-                temp_model = ConnectorAwareModel(cfg)
-                temp_trainer = ConnectorTrainer(temp_model, cfg, hf_repo_id=args.hf_repo_id, hf_token=args.hf_token)
+            if metadata:
+                start_file_idx = metadata.get('files_processed', 0)
+                start_epoch = metadata.get('epoch', 1)
                 
-                metadata = temp_trainer.load_checkpoint()
+                print(f"\n✓ Resuming from checkpoint:")
+                print(f"  - Starting epoch: {start_epoch}")
+                print(f"  - Files processed: {start_file_idx}")
                 
-                if metadata:
-                    start_file_idx = metadata.get('files_processed', 0)
-                    start_epoch = metadata.get('epoch', 1)
-                    
-                    print(f"\n✓ Resuming from checkpoint:")
-                    print(f"  - Starting epoch: {start_epoch}")
-                    print(f"  - Files processed: {start_file_idx}")
-                    
-                    model_wrapper = ConnectorAwareModel(cfg)
-                    model_wrapper.model = type(model_wrapper.model).from_pretrained(
-                        temp_trainer.checkpoint_dir,
-                        torch_dtype=torch.bfloat16 if cfg.torch_dtype == "bfloat16" else torch.float32,
-                        device_map="auto"
-                    )
-                    model_wrapper.tokenizer = temp_model.tokenizer
-                else:
-                    args.resume_training = False
+                # Reuse the model we just loaded
+                model_wrapper = temp_model
+            else:
+                print("⚠️ No metadata found. Starting fresh.")
+                args.resume_training = False
+                model_wrapper = temp_model
         
-        if not args.resume_training or model_wrapper is None:
+        if not args.resume_training and model_wrapper is None:
             print("\n" + "="*70)
             print("FRESH TRAINING MODE")
             print("="*70)
