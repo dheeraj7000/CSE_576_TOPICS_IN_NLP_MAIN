@@ -1,0 +1,10 @@
+{
+  "metrics": {
+    "split": "train",
+    "total_samples": 7376,
+    "correct_predictions": 2880,
+    "accuracy": 0.39045553145336226,
+    "model_name": "llama-3.2-3b-instruct",
+    "batch_size": 128
+  }
+}
